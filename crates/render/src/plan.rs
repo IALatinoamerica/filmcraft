@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use filmcraft_frame::VideoFrame;
 use filmcraft_geom::Affine;
-use filmcraft_project::{ItemId, ItemKind, Project, Sequence, TrackItem};
+use filmcraft_project::{EffectInstance, ItemId, ItemKind, Project, Sequence, TrackItem};
 use filmcraft_time::Tick;
 
 use crate::gpufx::FxOp;
@@ -91,6 +91,14 @@ pub enum FramePlan {
 #[derive(Clone)]
 pub enum PlanStep {
     Layers(Vec<PlanLayer>),
+    /// Apply enabled, non-intrinsic effects to the canvas so far, then mix by weight and blend.
+    /// Reserved for the adjustment planner; executors currently fall back for this step.
+    Adjust {
+        effects: Vec<EffectInstance>,
+        time: Tick,
+        weight: AdjustWeight,
+        blend: Blend,
+    },
     /// Inputs are isolated clip canvases; transition result composites Normal over lower tracks.
     Transition {
         inputs: [Vec<PlanLayer>; 2],
@@ -98,6 +106,20 @@ pub enum PlanStep {
         progress: f32,
         scale: f32,
     },
+}
+
+/// Adjustment opacity and the Motion-transformed frame that bounds its coverage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdjustWeight {
+    /// Layer opacity in 0..1 (opacity masks are not supported by adjustment plans).
+    pub opacity: f32,
+    /// Frame size in working pixels: rounded source dimensions times the render scale, at least 1.
+    pub frame_size: (usize, usize),
+    /// Maps the scaled frame's pixels to output pixels, as in `adjustment_region`.
+    pub matrix: Affine,
+    /// Working pixels per sequence pixel, also needed to evaluate spatial effect parameters.
+    /// Effects and their keyframe time alone do not retain the render scale.
+    pub px_scale: f32,
 }
 
 #[derive(Default)]
@@ -173,6 +195,7 @@ impl FramePlan {
                 .iter()
                 .map(|s| match s {
                     PlanStep::Layers(ls) => layers(ls),
+                    PlanStep::Adjust { .. } => 0,
                     PlanStep::Transition { inputs, .. } => inputs.iter().map(|ls| layers(ls)).sum(),
                 })
                 .sum(),
@@ -189,6 +212,7 @@ impl FramePlan {
                 .iter()
                 .map(|s| match s {
                     PlanStep::Layers(ls) => layer_side(ls),
+                    PlanStep::Adjust { weight, .. } => weight.frame_size.0.max(weight.frame_size.1),
                     PlanStep::Transition { inputs, .. } => inputs.iter().map(|ls| layer_side(ls)).max().unwrap_or(0),
                 })
                 .fold((*width).max(*height), usize::max),
@@ -607,6 +631,9 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
             for step in steps {
                 match step {
                     PlanStep::Layers(layers) => execute_layers(&mut canvas, layers),
+                    // This image-returning API uses an empty image for unavailable rendering.
+                    // Do not return a partially rendered canvas for an unsupported adjustment.
+                    PlanStep::Adjust { .. } => return crate::Image::new(*width, *height),
                     PlanStep::Transition { inputs, effect, progress, scale } => {
                         let [a, b] = inputs.each_ref().map(|layers| {
                             let mut input = crate::Image::new(*width, *height);

@@ -265,6 +265,8 @@ pub fn prepare(plan: &FramePlan) -> PreparedPlan {
                 .iter()
                 .flat_map(|s| match s {
                     PlanStep::Layers(layers) => vec![prepare_layers(layers)],
+                    // No source textures: execution falls back to the CPU plan executor.
+                    PlanStep::Adjust { .. } => Vec::new(),
                     PlanStep::Transition { inputs, .. } => inputs.iter().map(|ls| prepare_layers(ls)).collect(),
                 })
                 .collect(),
@@ -962,6 +964,10 @@ impl GpuCompositor {
                 PlanStep::Layers(layers) => {
                     let p = children.as_mut().and_then(Iterator::next);
                     self.render_plan(&FramePlan::Layers { width, height, layers: layers.clone() }, p, false, false);
+                }
+                PlanStep::Adjust { .. } => {
+                    let plan = FramePlan::Composite { width, height, steps: steps.to_vec() };
+                    return self.composite_prepared(&FramePlan::Image(filmcraft_render::plan::execute_cpu(&plan)), None);
                 }
                 PlanStep::Transition { inputs, effect, progress, .. } => {
                     let mut views = [self.dummy.clone(), self.dummy.clone()];
