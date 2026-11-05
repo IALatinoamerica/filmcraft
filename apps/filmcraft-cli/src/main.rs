@@ -272,6 +272,22 @@ impl filmcraft_export::FrameRenderer for GpuFrameRenderer {
     ) -> Option<filmcraft_render::Image> {
         self.0.render(project, seq, t, opts, sources)
     }
+
+    fn render_encoder_input(
+        &mut self,
+        project: &filmcraft_project::Project,
+        seq: filmcraft_project::ItemId,
+        t: filmcraft_time::Tick,
+        opts: filmcraft_render::RenderOptions,
+        sources: &dyn filmcraft_render::SourceProvider,
+    ) -> Option<filmcraft_export::RenderedFrame> {
+        self.0.render_encoder_input(project, seq, t, opts, sources).map(|frame| match frame {
+            filmcraft_gpu::export_renderer::ExportFrame::Image(image) => filmcraft_export::RenderedFrame::Image(image),
+            filmcraft_gpu::export_renderer::ExportFrame::Yuv420 { width, height, y, u, v } => {
+                filmcraft_export::RenderedFrame::Yuv420 { width, height, planes: (y, u, v) }
+            }
+        })
+    }
 }
 
 fn register_gpu_frame_renderer() {

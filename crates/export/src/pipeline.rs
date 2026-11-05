@@ -13,7 +13,9 @@ use filmcraft_time::FrameRate;
 use rayon::prelude::*;
 
 use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
-use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
+use crate::{
+    ExportError, ExportSettings, Format, FrameRenderer, GpuRendering, RenderedFrame, Result, Yuv420, build_frame_renderer, note_gpu_fallback, note_gpu_frame,
+};
 
 /// Image overlays originate outside the project and are expanded to f32 working images. This
 /// admits ordinary 4K artwork while keeping both source decode and resampling bounded.
@@ -59,6 +61,19 @@ impl Geometry {
         let render_scale = if settings.max_render_quality { 1.0f32.max(sy).max(sx / par) } else { sy.max(sx / par) }.clamp(0.01, 4.0);
         Geometry { w, h, render_scale, content: Some((cw, ch)), offset: ((w as i64 - cw as i64) / 2, (h as i64 - ch as i64) / 2) }
     }
+}
+
+fn gpu_yuv_eligible(settings: &ExportSettings, hdr_out: bool, geom: Geometry, rendered: (usize, usize)) -> bool {
+    let output = (geom.w as usize, geom.h as usize);
+    settings.video_format() == Format::H264
+        && settings.h264_profile.bit_depth() == 8
+        && !hdr_out
+        && !settings.signal.is_hdr()
+        && !settings.effects.any_video()
+        && geom.render_scale == 1.0
+        && geom.offset == (0, 0)
+        && rendered == output
+        && geom.content.unwrap_or(rendered) == output
 }
 
 /// GPU renderers shared by the export workers: a worker takes a free one for a frame and puts it
@@ -129,6 +144,7 @@ pub(crate) struct Pipeline {
     /// The registered frame renderers (GPU compositors) when the setting allows and factories
     /// provide them; pooled because `frame` runs on several export threads at once.
     renderer: Option<RendererPool>,
+    gpu_yuv: bool,
     pub seq: ItemId,
     /// Output frame rate (frame `f` is at `rate.tick_of(f)`).
     pub rate: FrameRate,
@@ -193,6 +209,7 @@ impl Pipeline {
             filmcraft_project::validate_frame_size(w, h).map_err(ExportError::Unsupported)?;
         }
         let (w, h) = filmcraft_render::output_size(q, geom.render_scale);
+        let gpu_yuv = gpu_yuv_eligible(settings, hdr_out, geom, (w, h));
         let w = u32::try_from(w).map_err(|_| ExportError::Unsupported("rendered picture width is too large".into()))?;
         let h = u32::try_from(h).map_err(|_| ExportError::Unsupported("rendered picture height is too large".into()))?;
         filmcraft_project::validate_frame_size(w, h).map_err(ExportError::Unsupported)?;
@@ -223,6 +240,7 @@ impl Pipeline {
         };
         Ok(Pipeline {
             renderer,
+            gpu_yuv,
             seq_rate: q.settings.frame_rate,
             start_tc: q.start_timecode,
             drop_frame: q.settings.drop_frame,
@@ -245,6 +263,10 @@ impl Pipeline {
     /// Output frame `f` as straight sRGB RGBA8 at the output size, or for HDR exports the encoded
     /// R'G'B' floats (3 per pixel).
     pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
+        self.frame_for_encoder(f, sources, false).0
+    }
+
+    pub(crate) fn frame_for_encoder(&self, f: i64, sources: &dyn SourceProvider, prepare_available: bool) -> ((Vec<u8>, Vec<f32>), Option<Yuv420>) {
         let t = self.rate.tick_of(f);
         // The registered GPU renderer goes first; `None` (no adapter, a plan the GPU cannot
         // draw, any internal error) falls back to the CPU reference renderer below. A frame the
@@ -268,14 +290,28 @@ impl Pipeline {
                 let asked = web_time::Instant::now();
                 pool.with(|r| {
                     crate::note_lock_wait(asked.elapsed());
-                    r.render(&self.project, self.seq, t, self.opts, sources)
+                    if self.gpu_yuv && prepare_available {
+                        match r.render_encoder_input(&self.project, self.seq, t, self.opts, sources) {
+                            Some(RenderedFrame::Yuv420 { width, height, planes }) if (width, height) == (self.w, self.h) => {
+                                Some(RenderedFrame::Yuv420 { width, height, planes })
+                            }
+                            Some(RenderedFrame::Yuv420 { .. }) => r.render(&self.project, self.seq, t, self.opts, sources).map(RenderedFrame::Image),
+                            frame => frame,
+                        }
+                    } else {
+                        r.render(&self.project, self.seq, t, self.opts, sources).map(RenderedFrame::Image)
+                    }
                 })
                 .flatten()
             }
             None => None,
         };
         let img = match gpu {
-            Some(img) => {
+            Some(RenderedFrame::Yuv420 { planes, .. }) => {
+                note_gpu_frame();
+                return ((Vec::new(), Vec::new()), Some(planes));
+            }
+            Some(RenderedFrame::Image(img)) => {
                 note_gpu_frame();
                 img
             }
@@ -302,7 +338,7 @@ impl Pipeline {
             }
             // the float image is not needed any more: its buffer serves the next frame's layers
             filmcraft_frame::pool::recycle_f32(img.px);
-            return (Vec::new(), out);
+            return ((Vec::new(), out), None);
         }
         let mut rgba = if self.alpha { img.to_rgba8() } else { img.over_black_rgba8() };
         // the float image is not needed any more: its buffer serves the next frame's layers
@@ -311,7 +347,7 @@ impl Pipeline {
             let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Effects);
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
-        (rgba, Vec::new())
+        ((rgba, Vec::new()), None)
     }
 
     /// Fit the rendered picture into the output frame.
@@ -554,6 +590,45 @@ fn limit_px(c: &mut [f32; 3], lo: f32, hi: f32) {
         c.iter_mut().for_each(|v| *v += d);
     }
     c.iter_mut().for_each(|v| *v = v.clamp(0.0, hi.max(lo)));
+}
+
+#[cfg(test)]
+mod gpu_yuv_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_yuv_eligibility() {
+        let settings = ExportSettings { format: Format::H264, ..Default::default() };
+        let geom = Geometry { w: 1920, h: 1080, render_scale: 1.0, content: None, offset: (0, 0) };
+        let rendered = (1920, 1080);
+        assert!(gpu_yuv_eligible(&settings, false, geom, rendered));
+        assert!(gpu_yuv_eligible(&settings, false, Geometry { content: Some(rendered), ..geom }, rendered));
+
+        let mut changed = settings.clone();
+        changed.effects.image_overlay.enabled = true;
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+        let mut changed = settings.clone();
+        changed.effects.name_overlay.enabled = true;
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+        let mut changed = settings.clone();
+        changed.effects.timecode_overlay.enabled = true;
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+        let mut changed = settings.clone();
+        changed.effects.video_limiter.enabled = true;
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+        let changed = ExportSettings { h264_profile: crate::H264Profile::High10, ..settings.clone() };
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+        let changed = ExportSettings { format: Format::Hevc, ..settings.clone() };
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+        assert!(!gpu_yuv_eligible(&settings, true, geom, rendered));
+        let changed = ExportSettings { signal: crate::ColorSignal::PQ, ..settings.clone() };
+        assert!(!gpu_yuv_eligible(&changed, false, geom, rendered));
+
+        for changed in [Geometry { render_scale: 0.5, ..geom }, Geometry { offset: (1, 0), ..geom }, Geometry { content: Some((1918, 1080)), ..geom }] {
+            assert!(!gpu_yuv_eligible(&settings, false, changed, rendered));
+        }
+        assert!(!gpu_yuv_eligible(&settings, false, geom, (1918, 1080)));
+    }
 }
 
 #[cfg(test)]

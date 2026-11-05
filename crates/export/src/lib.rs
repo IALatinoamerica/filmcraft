@@ -73,6 +73,7 @@ pub use registry::{
     encoder_registered, frame_renderer_registered, hdr_available, register_audio_encoder, register_encoder, register_format_probe, register_frame_renderer,
     register_hdr_probe,
 };
+pub use registry::{RenderedFrame, Yuv420};
 use registry::{audio_factories, video_factories};
 #[cfg(test)]
 use run::gif_delay_cs;

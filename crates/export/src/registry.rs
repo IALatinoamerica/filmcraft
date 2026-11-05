@@ -28,7 +28,16 @@ pub struct EncoderFrame<'a> {
 
 /// Per-picture work an encoder hands to the export's render threads, see
 /// [`VideoEncoder::prepare_ahead`].
-pub type PrepareAhead = std::sync::Arc<dyn Fn(&EncoderFrame) + Send + Sync>;
+pub type PrepareAhead = std::sync::Arc<dyn Fn(&EncoderFrame, Option<Yuv420>) + Send + Sync>;
+
+/// Tight 8-bit Y, U and V planes in limited-range BT.709 4:2:0.
+pub type Yuv420 = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// A rendered picture, optionally already converted to the encoder's input planes.
+pub enum RenderedFrame {
+    Image(filmcraft_render::Image),
+    Yuv420 { width: u32, height: u32, planes: Yuv420 },
+}
 
 pub trait VideoEncoder: Send {
     /// MP4/MOV sample entry (codec config) — may only be complete after the first frame.
@@ -117,6 +126,17 @@ pub trait FrameRenderer: Send {
         opts: filmcraft_render::RenderOptions,
         sources: &dyn SourceProvider,
     ) -> Option<filmcraft_render::Image>;
+
+    fn render_encoder_input(
+        &mut self,
+        project: &Project,
+        seq: ItemId,
+        t: Tick,
+        opts: filmcraft_render::RenderOptions,
+        sources: &dyn SourceProvider,
+    ) -> Option<RenderedFrame> {
+        self.render(project, seq, t, opts, sources).map(RenderedFrame::Image)
+    }
 }
 
 /// Builds the frame renderer for one export, or `None` when this host cannot (no adapter).

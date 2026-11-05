@@ -93,6 +93,11 @@ fn device_failed() -> bool {
     DEVICE_FAILED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+pub enum ExportFrame {
+    Image(filmcraft_render::Image),
+    Yuv420 { width: u32, height: u32, y: Vec<u8>, u: Vec<u8>, v: Vec<u8> },
+}
+
 pub struct ExportRenderer {
     _instance: wgpu::Instance,
     #[expect(dead_code, reason = "kept for future frame-accuracy flows (readback fences)")]
@@ -100,6 +105,7 @@ pub struct ExportRenderer {
     #[expect(dead_code, reason = "kept for future frame-accuracy flows (readback fences)")]
     queue: wgpu::Queue,
     compositor: GpuCompositor,
+    yuv: Option<crate::yuv::YuvStage>,
 }
 
 impl ExportRenderer {
@@ -145,7 +151,34 @@ impl ExportRenderer {
             return None;
         }
         let compositor = GpuCompositor::new(&device, &queue);
-        Some(Self { _instance: instance, device, queue, compositor })
+        let yuv = crate::yuv::YuvStage::new(&device);
+        Some(Self { _instance: instance, device, queue, compositor, yuv })
+    }
+
+    /// Same parameters as `render`: GPU frames return YUV420, CPU-planned frames their image.
+    pub fn render_encoder_input(&mut self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Option<ExportFrame> {
+        let plan = plan_frame(project, seq, t, opts, sources);
+        match &plan {
+            FramePlan::Image(img) => {
+                filmcraft_frame::gpu_stats::note_cpu_whole_frame(filmcraft_frame::gpu_stats::CpuWholeFrame::PlanExhausted);
+                Some(ExportFrame::Image(img.clone()))
+            }
+            FramePlan::Layers { .. } | FramePlan::Composite { .. } => {
+                if device_failed() {
+                    return None;
+                }
+                let started = std::time::Instant::now();
+                let prep = prepare(&plan);
+                filmcraft_frame::gpu_stats::add_upload_prep(started.elapsed());
+                let (width, height, y, u, v) = self.compositor.render_export_yuv_prepared(&plan, Some(&prep), self.yuv.as_mut()?)?;
+                if device_failed() {
+                    return None;
+                }
+                filmcraft_frame::render_timing::mark_gpu_frame();
+                timing::add_frame();
+                Some(ExportFrame::Yuv420 { width, height, y, u, v })
+            }
+        }
     }
 
     /// One frame as `render_sequence` would return it (premultiplied linear-light RGBA at the

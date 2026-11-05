@@ -2,7 +2,7 @@ use super::convert::{
     Matrix, Planes444, rgba_to_yuv420_8, rgba_to_yuv420_10, rgba_to_yuv422_10, rgbf_to_yuv420_8, rgbf_to_yuv420_10, rgbf_to_yuv422_10, to_yuv444_10,
 };
 use super::format::{ColorSignal, DEFAULT_CRF, ExportSettings, Format, H264Pass};
-use super::registry::{AudioEncoder, EncodedPacket, EncoderFrame, PrepareAhead, VideoEncoder};
+use super::registry::{AudioEncoder, EncodedPacket, EncoderFrame, PrepareAhead, VideoEncoder, Yuv420};
 use super::stats::{Stage, timed};
 use super::{BitrateMode, ExportError, FrameRate, H264Profile, Result, SampleEntry, SampleFormat};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -370,8 +370,6 @@ struct H264Encoder {
     ready: Arc<Mutex<std::collections::HashMap<u64, Yuv420>>>,
 }
 
-type Yuv420 = (Vec<u8>, Vec<u8>, Vec<u8>);
-
 /// The encoder input of `f`: 8-bit limited-range 4:2:0 in the export's colour signal.
 fn h264_input(f: &EncoderFrame, signal: ColorSignal, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
     match f.hdr {
@@ -447,6 +445,9 @@ impl VideoEncoder for H264Encoder {
         match ready.filter(|(y, u, v)| y.len() == w * h && u.len() == chroma && v.len() == chroma) {
             Some((y, u, v)) => (self.y, self.u, self.v) = (y, u, v),
             None => {
+                if f.hdr.is_none() && f.rgba.is_empty() {
+                    return Err(ExportError::Encode("H.264 frame has neither prepared YUV planes nor RGBA pixels".into()));
+                }
                 let (enc, y, u, v, signal) = (&self.enc, &mut self.y, &mut self.u, &mut self.v, self.signal);
                 // on the encoder's own threads: the global pool is busy rendering the next batch
                 timed(Stage::Convert, || enc.install(|| h264_input(f, signal, y, u, v)));
@@ -474,7 +475,11 @@ impl VideoEncoder for H264Encoder {
             return None;
         }
         let (ready, signal) = (self.ready.clone(), self.signal);
-        Some(Arc::new(move |f: &EncoderFrame| {
+        Some(Arc::new(move |f: &EncoderFrame, planes: Option<Yuv420>| {
+            if let Some(planes) = planes {
+                ready.lock().unwrap_or_else(PoisonError::into_inner).insert(f.index, planes);
+                return;
+            }
             let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
             timed(Stage::Convert, || h264_input(f, signal, &mut y, &mut u, &mut v));
             ready.lock().unwrap_or_else(PoisonError::into_inner).insert(f.index, (y, u, v));
@@ -541,4 +546,40 @@ pub(crate) fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &
             })
             .map_err(|e| ExportError::Encode(e.to_string())),
     )
+}
+
+#[cfg(test)]
+mod gpu_yuv_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_yuv_planes_reach_encoder_unchanged() {
+        let (w, h) = (16, 16);
+        let enc = H264Encoder {
+            enc: filmcraft_h264enc::Encoder::new(filmcraft_h264enc::EncoderConfig::new(w, h, 24, 1)).unwrap(),
+            w,
+            h,
+            rate: FrameRate::FPS_24,
+            y: Vec::new(),
+            u: Vec::new(),
+            v: Vec::new(),
+            y16: Vec::new(),
+            u16: Vec::new(),
+            v16: Vec::new(),
+            signal: ColorSignal::default(),
+            ready: Default::default(),
+        };
+        let prepare = enc.prepare_ahead().unwrap();
+        let supplied = (vec![37; 256], vec![83; 64], vec![192; 64]);
+        let frame = EncoderFrame { width: w, height: h, rgba: &[], hdr: None, index: 7 };
+        prepare(&frame, Some(supplied.clone()));
+        assert_eq!(enc.ready.lock().unwrap().remove(&7), Some(supplied));
+
+        let rgba = [230, 41, 94, 255].repeat(256);
+        let frame = EncoderFrame { rgba: &rgba, index: 8, ..frame };
+        let (mut y, mut u, mut v) = Default::default();
+        h264_input(&frame, enc.signal, &mut y, &mut u, &mut v);
+        prepare(&frame, None);
+        assert_eq!(enc.ready.lock().unwrap().remove(&8), Some((y, u, v)));
+    }
 }

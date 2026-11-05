@@ -541,12 +541,12 @@ fn h264_input_converted_ahead_encodes_to_the_same_packets() {
         if ahead {
             let prepare = enc.prepare_ahead().expect("the H.264 encoder converts ahead");
             for i in (0..frames.len()).rev().filter(|&i| i != 3) {
-                prepare(&frame(i));
+                prepare(&frame(i), None);
             }
             // a picture of another size under index 5: the encoder converts that one itself
-            prepare(&EncoderFrame { width: w / 2, height: h / 2, rgba: &frames[5][..(w * h) as usize], hdr: None, index: 5 });
+            prepare(&EncoderFrame { width: w / 2, height: h / 2, rgba: &frames[5][..(w * h) as usize], hdr: None, index: 5 }, None);
             // and one it is never asked to encode
-            prepare(&EncoderFrame { index: 99, ..frame(0) });
+            prepare(&EncoderFrame { index: 99, ..frame(0) }, None);
         }
         let mut out = Vec::new();
         for i in 0..frames.len() {

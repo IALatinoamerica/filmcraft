@@ -131,14 +131,14 @@ fn render_batch(
         .map(|fi| {
             let _active = batch_clock.task();
             filmcraft_frame::render_timing::task(|| {
-                let frame = filmcraft_media::cancel::with_export(true, || pipe.frame(fi, sources));
+                let (frame, planes) = filmcraft_media::cancel::with_export(true, || pipe.frame_for_encoder(fi, sources, prepare.is_some()));
                 if filmcraft_media::pending::take() {
                     pending.store(true, Ordering::Relaxed);
                 }
                 if let Some(prepare) = prepare {
                     let _convert = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
                     let index = u64::try_from(fi - f0).unwrap_or(u64::MAX);
-                    prepare(&EncoderFrame { width: pipe.w, height: pipe.h, rgba: &frame.0, hdr: pipe.hdr_out.then_some(frame.1.as_slice()), index });
+                    prepare(&EncoderFrame { width: pipe.w, height: pipe.h, rgba: &frame.0, hdr: pipe.hdr_out.then_some(frame.1.as_slice()), index }, planes);
                 }
                 frame
             })
