@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use filmcraft_frame::VideoFrame;
 use filmcraft_geom::Affine;
-use filmcraft_media::FrameRequest;
 use filmcraft_project::{ItemId, ItemKind, Project, Sequence, TrackItem};
 use filmcraft_time::Tick;
 
@@ -29,7 +28,7 @@ use crate::{Blend, RenderOptions, SourceProvider, motion_matrix, output_size};
 
 /// A GPU frame plan retains every resolved source frame. Nested sequences may share the same
 /// child sequence many times, so recursion depth alone does not bound this expansion.
-const MAX_PLAN_LAYERS: usize = 4096;
+pub(crate) const MAX_PLAN_LAYERS: usize = 4096;
 
 /// One layer for the GPU, bottom to top.
 #[derive(Clone)]
@@ -258,6 +257,19 @@ pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOption
     layers.finish(w, h)
 }
 
+/// Predict [`plan_frame`]'s ordered source requests without decoding. See
+/// [`crate::source_frame_requests`] for the inputs and best-effort behavior. Duplicate CPU
+/// fallback fetches and frame-dependent effect lookups are omitted.
+pub fn source_frame_requests(
+    project: &Project,
+    seq_id: ItemId,
+    t: Tick,
+    opts: RenderOptions,
+    sources: &dyn SourceProvider,
+) -> Option<Vec<(ItemId, filmcraft_media::FrameRequest)>> {
+    crate::source_requests::for_frame(project, seq_id, t, opts, sources, true)
+}
+
 /// Whether [`plan_frame`] hands the frame at `t` back as one CPU image ([`FramePlan::Image`]). A
 /// GPU renderer gains nothing on such a frame, so a caller with only a few of them (the export's
 /// pool) can render it on the CPU without taking one.
@@ -310,11 +322,10 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
         if !tr.enabled {
             continue;
         }
-        if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t)) {
+        let layer = crate::track_layer_at(tr, t);
+        if let Some(crate::TrackLayer::Transition(trn, a, b)) = layer {
             // These dissolves are symmetric: Reverse (play B→A backwards) renders the same frames.
             let p = trn.progress(t) as f32;
-            let a = trn.from.and_then(|id| tr.item(id)).filter(|i| i.enabled);
-            let b = trn.to.and_then(|id| tr.item(id)).filter(|i| i.enabled);
             match trn.effect.effect.as_str() {
                 "push" => {
                     let mut inputs = [Vec::new(), Vec::new()];
@@ -357,10 +368,7 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
             }
             continue;
         }
-        let Some(item) = tr.item_at(t) else { continue };
-        if !item.enabled {
-            continue;
-        }
+        let Some(crate::TrackLayer::Item(item)) = layer else { continue };
         push_item(sc, item, 1.0, None, layers);
     }
 }
@@ -471,12 +479,11 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
         let Some(src) = sources.source(item.item) else { return };
         let Some(size) = crate::source_size(project, item.item) else { return };
         let motion = motion_matrix(seq, item, size, crate::source_par(project, item.item), mt);
-        let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
-        let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
-        let time = crate::video_source_time(item, t, src.info().frame_rate());
+        let want = crate::source_scale(&motion, opts.scale);
+        let request = crate::video_frame_request(item, t, src.info().frame_rate(), want);
         // The GPU turns the frame as decoded, the container's display rotation folded into the
         // layer's matrix or its effect stage: turning a 4K frame on the CPU is too slow to play (#3467).
-        let Ok((frame, turns)) = src.video_frame_unturned(FrameRequest { time, scale: want }) else { return };
+        let Ok((frame, turns)) = src.video_frame_unturned(request) else { return };
         let upright = |f: &VideoFrame| if turns % 2 == 1 { (f.height, f.width) } else { (f.width, f.height) };
         let cs = crate::colorman::source_space(project, item.item, &frame);
         // HDR and wide-gamut media on a Rec. 709 sequence is converted on the GPU too (#965); log

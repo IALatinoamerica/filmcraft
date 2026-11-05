@@ -219,6 +219,8 @@ fn decode_start(s: &dyn VideoSamples, i: usize) -> usize {
 
 struct State {
     decoder: Option<Box<dyn VideoDecoder>>,
+    /// Export pinning shares the decoder lock so trimming cannot race a pin change.
+    export_pinned: bool,
     /// A decoder existed before the current fresh one; committed after seek classification.
     had_decoder: bool,
     /// The current decoder has not yet reached seek classification.
@@ -269,6 +271,9 @@ impl State {
         if let Some(d) = self.decoder.take() {
             self.had_decoder = true;
             pool.decoders.fetch_sub(1, Ordering::Relaxed);
+            if !self.export_pinned {
+                pool.unpinned_decoders.fetch_sub(1, Ordering::Relaxed);
+            }
             out.push(d);
         }
         self.next = usize::MAX;
@@ -426,6 +431,8 @@ struct Pool {
     caches: Mutex<Vec<Weak<Shared>>>,
     /// Caches that hold a decoder.
     decoders: AtomicUsize,
+    /// Live decoders subject to the limits; `decoders` still includes export-pinned caches.
+    unpinned_decoders: AtomicUsize,
     max_decoders: usize,
     idle: Duration,
     /// Caches idle at least this long are no longer in use (see [`RECENT`]).
@@ -476,6 +483,7 @@ impl Pool {
         Self {
             caches: Mutex::new(Vec::new()),
             decoders: AtomicUsize::new(0),
+            unpinned_decoders: AtomicUsize::new(0),
             max_decoders,
             idle,
             recent: idle,
@@ -532,14 +540,16 @@ impl Pool {
         let mut released = Vec::new();
         // first the caches idle for long, down to the cap; then those a burst has left behind
         for (idle, cap) in [(self.idle, self.max_decoders), (self.recent, self.hard_decoders)] {
-            if self.decoders.load(Ordering::Relaxed) <= cap {
+            if self.unpinned_decoders.load(Ordering::Relaxed) <= cap {
                 continue;
             }
-            for c in self.idle_others(me, idle, |st, _| st.decoder.is_some()) {
-                if self.decoders.load(Ordering::Relaxed) <= cap {
+            for c in self.idle_others(me, idle, |st, _| st.decoder.is_some() && !st.export_pinned) {
+                if self.unpinned_decoders.load(Ordering::Relaxed) <= cap {
                     break;
                 }
-                if let Some(mut st) = try_state(&c) {
+                if let Some(mut st) = try_state(&c)
+                    && !st.export_pinned
+                {
                     released.extend(st.release_decoder(self));
                 }
             }
@@ -559,6 +569,7 @@ impl Pool {
         let mut released = Vec::new();
         for c in all.iter().filter(|c| !std::ptr::eq(Arc::as_ptr(c), me)) {
             if let Some(mut st) = try_state(c)
+                && !st.export_pinned
                 && let Some(frames) = try_frames(c)
                 && frames.background
                 && st.decoder.is_some()
@@ -577,6 +588,7 @@ impl Pool {
         for c in &all {
             // try-locked: a cache another thread holds is decoding, so it is in use
             if let Some(mut st) = try_state(c)
+                && !st.export_pinned
                 && let Some(mut frames) = try_frames(c)
             {
                 frames.release_frames(self, || true);
@@ -720,6 +732,7 @@ impl GopCache {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 decoder: None,
+                export_pinned: false,
                 had_decoder: false,
                 fresh_decoder: false,
                 intra: false,
@@ -744,6 +757,23 @@ impl GopCache {
         });
         pool.register(&shared);
         Self { shared, explicit_color, rotation: 0, crop: None, budget: FRAME_CACHE_CEILING }
+    }
+
+    /// Exclude this cache's decoder from the limits and recycling while export work needs it.
+    /// A boolean pin: repeated pin or unpin calls are idempotent.
+    pub fn set_export_pinned(&self, pinned: bool) {
+        let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.export_pinned == pinned {
+            return;
+        }
+        if st.decoder.is_some() {
+            if pinned {
+                self.shared.pool.unpinned_decoders.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                self.shared.pool.unpinned_decoders.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        st.export_pinned = pinned;
     }
 
     /// Turn every decoded frame clockwise by `quarter_turns` × 90° (the container's display
@@ -977,6 +1007,9 @@ impl GopCache {
             st.decoder = Some(d);
             st.fresh_decoder = true;
             st.next = usize::MAX;
+            if !st.export_pinned {
+                self.shared.pool.unpinned_decoders.fetch_add(1, Ordering::Relaxed);
+            }
             let live = self.shared.pool.decoders.fetch_add(1, Ordering::Relaxed).saturating_add(1);
             LIVE_DECODERS_PEAK.fetch_max(live, Ordering::Relaxed);
         }

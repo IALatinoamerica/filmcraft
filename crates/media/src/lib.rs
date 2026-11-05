@@ -217,6 +217,11 @@ pub trait MediaSource: Send + Sync {
     fn info(&self) -> &MediaInfo;
     /// The frame displayed at media time `req.time`.
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
+    /// Best-effort hint: decode requests in order into the cache; ignore errors for the real fetch to report.
+    fn prefetch(&self, _requests: &[FrameRequest]) {}
+    /// While pinned (an export has scheduled work on this source), its decoder is not counted
+    /// toward the live-decoder limits and is not recycled. Default: no-op.
+    fn set_export_pinned(&self, _pinned: bool) {}
     /// Like [`video_frame`](Self::video_frame), but a source may leave the container's display
     /// rotation to the caller: the frame comes with the clockwise quarter turns still to apply
     /// to it (0: upright, as `video_frame` returns it).

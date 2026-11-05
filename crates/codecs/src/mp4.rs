@@ -505,6 +505,16 @@ impl MediaSource for Mp4Source {
         Ok(f)
     }
 
+    fn prefetch(&self, requests: &[FrameRequest]) {
+        for &req in requests {
+            let _ = self.video_frame(req);
+        }
+    }
+
+    fn set_export_pinned(&self, pinned: bool) {
+        self.video.set_export_pinned(pinned);
+    }
+
     /// The frame as decoded, with the display matrix's rotation left to the caller (#3467). The
     /// time lookup is `video_at`'s.
     fn video_frame_unturned(&self, req: FrameRequest) -> Result<(Arc<VideoFrame>, u8), MediaError> {

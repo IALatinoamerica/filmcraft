@@ -573,6 +573,12 @@ impl MediaSource for UnsupportedAsSlate {
     fn info(&self) -> &MediaInfo {
         self.inner.info()
     }
+    fn prefetch(&self, requests: &[FrameRequest]) {
+        self.inner.prefetch(requests);
+    }
+    fn set_export_pinned(&self, pinned: bool) {
+        self.inner.set_export_pinned(pinned);
+    }
     fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
         match self.inner.video_frame(req) {
             Err(MediaError::Unsupported(why)) => {
@@ -885,6 +891,41 @@ mod tests {
         }
         fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
             Ok(AudioBuffer::silence(sample_rate, 3, frames))
+        }
+    }
+
+    #[test]
+    fn unsupported_as_slate_prefetch_forwards_and_preserves_frames() {
+        struct Recording(GeneratorSource, Mutex<Vec<FrameRequest>>);
+        impl MediaSource for Recording {
+            fn info(&self) -> &MediaInfo {
+                self.0.info()
+            }
+            fn prefetch(&self, requests: &[FrameRequest]) {
+                self.1.lock().unwrap().extend_from_slice(requests);
+            }
+            fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+                self.0.video_frame(req)
+            }
+            fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+                self.0.audio(start, frames, sample_rate)
+            }
+        }
+        let rate = filmcraft_time::FrameRate::FPS_24;
+        let inner = Arc::new(Recording(
+            GeneratorSource::new(filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Aurora), 16, 8, rate, rate.tick_of(24)),
+            Mutex::new(Vec::new()),
+        ));
+        let pool = MediaPool::default();
+        let src = pool.unsupported_as_slate(ItemId(1), "a.mov", inner.clone());
+        let requests: Vec<_> = (3..6).map(|i| FrameRequest::full(rate.tick_of(i))).collect();
+        let expected: Vec<_> = requests.iter().map(|&req| src.video_frame(req).unwrap()).collect();
+        src.prefetch(&requests);
+        assert_eq!(*inner.1.lock().unwrap(), requests);
+        for (&req, expected) in requests.iter().zip(expected) {
+            let actual = src.video_frame(req).unwrap();
+            assert_eq!(actual.pts, expected.pts);
+            assert_eq!(actual.to_rgba8(), expected.to_rgba8());
         }
     }
 

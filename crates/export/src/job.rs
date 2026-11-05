@@ -155,6 +155,7 @@ pub enum Step {
 /// An export of an encoded-video format, advanced one batch at a time.
 pub struct Exporter {
     pipe: Arc<Pipeline>,
+    schedule: Option<crate::schedule::Scheduler>,
     settings: ExportSettings,
     f0: i64,
     f1: i64,
@@ -188,6 +189,14 @@ pub struct Exporter {
     vt: usize,
     at: Option<usize>,
     t0: web_time::Instant,
+}
+
+impl Drop for Exporter {
+    fn drop(&mut self) {
+        if let Some(schedule) = &mut self.schedule {
+            let _ = schedule.stop(true);
+        }
+    }
 }
 
 /// Whether [`Exporter`] handles a format.
@@ -287,6 +296,8 @@ impl Exporter {
         };
         let measured = !settings.effects.loudness.enabled || audio.is_none();
         Ok(Self {
+            schedule: (std::env::var_os("FILMCRAFT_EXPORT_SCHEDULER").as_deref() != Some(std::ffi::OsStr::new("0")) && !cfg!(target_arch = "wasm32"))
+                .then(|| crate::schedule::Scheduler::new(pipe.clone())),
             pipe,
             f0,
             f1,
@@ -461,6 +472,19 @@ impl Exporter {
 
     /// Render, encode and mux the next batch (or finish the file).
     pub fn step(&mut self, sources: &dyn SourceProvider, progress: &Progress) -> Result<Step> {
+        let result = self.step_scheduled(sources, progress);
+        if (result.is_err() || matches!(result, Ok(Step::Done(_))))
+            && let Some(schedule) = &mut self.schedule
+        {
+            let stopped = schedule.stop(result.is_err());
+            if result.is_ok() {
+                stopped?;
+            }
+        }
+        result
+    }
+
+    fn step_scheduled(&mut self, sources: &dyn SourceProvider, progress: &Progress) -> Result<Step> {
         if progress.cancel.load(Ordering::Relaxed) {
             self.ahead = None;
             return Err(ExportError::Cancelled);
@@ -484,10 +508,17 @@ impl Exporter {
             return Ok(Step::Progress);
         }
         if self.next < self.f1 {
+            if let Some(schedule) = &mut self.schedule {
+                catch_unwind(AssertUnwindSafe(|| schedule.advance(self.next, self.f1, sources, progress.cancel.load(Ordering::Relaxed))))
+                    .map_err(|_| ExportError::Encode("internal error while prefetching source frames".into()))??;
+            }
             return self.step_batch(sources, progress);
         }
         self.ahead = None;
         if self.first_pass {
+            if let Some(schedule) = &mut self.schedule {
+                schedule.stop(false)?;
+            }
             // end of the analysis pass: encode for real with its statistics
             let _ = self.venc.flush()?;
             let stats = self.venc.pass_stats().ok_or_else(|| ExportError::Encode("two-pass statistics missing".into()))?;
@@ -790,3 +821,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "schedule_tests.rs"]
+mod schedule_tests;

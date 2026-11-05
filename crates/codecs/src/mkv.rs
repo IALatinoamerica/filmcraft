@@ -636,6 +636,16 @@ impl MediaSource for MkvSource {
         &self.info
     }
 
+    fn prefetch(&self, requests: &[FrameRequest]) {
+        for &req in requests {
+            let _ = self.video_frame(req);
+        }
+    }
+
+    fn set_export_pinned(&self, pinned: bool) {
+        self.video.set_export_pinned(pinned);
+    }
+
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let ti = self.vtrack.ok_or(MediaError::NoStream("video"))?;
         let t = req.time.max(Tick::ZERO);

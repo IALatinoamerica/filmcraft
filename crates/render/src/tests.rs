@@ -613,3 +613,260 @@ fn in_between_frames_stay_inside_the_source_range() {
         }
     }
 }
+
+struct RequestRecordingProvider {
+    sources: SourceMap,
+    asked: Arc<std::sync::Mutex<Vec<(ItemId, FrameRequest, Tick)>>>,
+    pts: Arc<Vec<Tick>>,
+}
+
+impl RequestRecordingProvider {
+    fn assert_frame_requests(&self, p: &Project, seq: ItemId, t: Tick, opts: RenderOptions) -> Vec<(ItemId, FrameRequest)> {
+        let mut requests = Vec::new();
+        for planned in [false, true] {
+            self.asked.lock().unwrap().clear();
+            let predicted = if planned { plan::source_frame_requests(p, seq, t, opts, self) } else { source_frame_requests(p, seq, t, opts, self) }.unwrap();
+            assert!(self.asked.lock().unwrap().is_empty(), "prediction must not fetch frames");
+            if planned {
+                plan::plan_frame(p, seq, t, opts, self);
+            } else {
+                render_sequence(p, seq, t, opts, self);
+            }
+            let asked = self.asked.lock().unwrap();
+            requests = asked.iter().map(|&(item, req, _)| (item, req)).collect();
+            let mut distinct = Vec::new();
+            for request in &requests {
+                if !distinct.contains(request) {
+                    distinct.push(*request);
+                }
+            }
+            let mut hints = Vec::new();
+            for request in &predicted {
+                if !hints.contains(request) {
+                    hints.push(*request);
+                }
+            }
+            assert_eq!(hints, distinct, "time={t:?}, scale={}, planned={planned}", opts.scale);
+            for &(item, req, pts) in asked.iter() {
+                if self.sources.source(item).unwrap().info().kind != filmcraft_media::MediaKind::Still {
+                    let index = self.pts.partition_point(|&pts| pts <= req.time) - 1;
+                    assert_eq!(pts, self.pts[index]);
+                }
+            }
+        }
+        requests
+    }
+}
+
+impl SourceProvider for RequestRecordingProvider {
+    fn source(&self, item: ItemId) -> Option<SharedSource> {
+        Some(Arc::new(RequestRecordingSource { item, inner: self.sources.source(item)?, asked: self.asked.clone(), pts: self.pts.clone() }))
+    }
+}
+
+struct RequestRecordingSource {
+    item: ItemId,
+    inner: SharedSource,
+    asked: Arc<std::sync::Mutex<Vec<(ItemId, FrameRequest, Tick)>>>,
+    pts: Arc<Vec<Tick>>,
+}
+
+impl MediaSource for RequestRecordingSource {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        // An irregular, synthetic VFR sample table. Like a container, the source alone resolves
+        // a request to the last PTS at or before it; no file or decoder is involved.
+        let pts = if self.info().kind == filmcraft_media::MediaKind::Still {
+            Tick::ZERO
+        } else {
+            *self.pts.iter().rfind(|&&pts| pts <= req.time).or_else(|| self.pts.first()).unwrap()
+        };
+        self.asked.lock().unwrap().push((self.item, req, pts));
+        self.inner.video_frame(FrameRequest { time: pts, ..req })
+    }
+    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        self.inner.audio(start, frames, sample_rate)
+    }
+}
+
+#[test]
+fn source_frame_requests_match_cpu_and_plan_for_every_synthetic_frame() {
+    let r = FrameRate::FPS_24;
+    let mut p = Project::new("source requests");
+    let mut sources = SourceMap::default();
+    let mut add = |p: &mut Project, name: &str, src: SharedSource| {
+        let item = p.add_item(
+            name,
+            Label::Iris,
+            ItemKind::Media(Box::new(MediaClip {
+                media: MediaRef::File { path: name.into() },
+                info: src.info().clone(),
+                interpret: Default::default(),
+                mark_in: None,
+                mark_out: None,
+                markers: vec![],
+                offline: false,
+                proxy: None,
+                identity: None,
+            })),
+            None,
+        );
+        sources.0.insert(item, src);
+        item
+    };
+    let movie = add(&mut p, "synthetic.mp4", Arc::new(GeneratorSource::new(Generator::ColorMatte { color: [0.2, 0.4, 0.6, 1.0] }, 8, 8, r, r.tick_of(200))));
+    let still = add(&mut p, "synthetic.png", Arc::new(filmcraft_media::still::StillSource::from_rgba("synthetic.png", 8, 8, vec![128; 256], false, 256)));
+    let seq = p.new_sequence("synthetic", SequenceSettings { width: 8, height: 8, frame_rate: r, ..Default::default() }, 3, 0, None);
+    // Each cut enters five frames after a synthetic 12-frame GOP boundary. Only the requested
+    // positions matter here: GOP decoding and pre-roll belong to the scheduler/cache tests.
+    let mut clips = Vec::new();
+    for (start, source_in, speed, reverse) in [(0, 5, 1.0, false), (6, 17, 1.5, false), (12, 29, 1.0, true), (18, 41, 1.0, false), (24, 53, 1.0, false)] {
+        let id = place(&mut p, seq, 0, movie, start, 6);
+        let clip = p.sequence_mut(seq).unwrap().find_item_mut(id).unwrap().1;
+        clip.source_in = r.tick_of(source_in);
+        clip.speed = speed;
+        clip.reverse = reverse;
+        clips.push(id);
+    }
+    let remapped = p.sequence_mut(seq).unwrap().find_item_mut(clips[3]).unwrap().1;
+    remapped.effect_mut("time_remap").unwrap().params.get_mut("speed").unwrap().keyframes =
+        vec![filmcraft_project::Keyframe::new(Tick::ZERO, ParamValue::Float(50.0)), filmcraft_project::Keyframe::new(r.tick_of(6), ParamValue::Float(250.0))];
+    // Keep the existing renderer behavior: Time Remapping keys currently do not change the
+    // source time. A hold, however, does, including on a reversed clip.
+    let held = p.sequence_mut(seq).unwrap().find_item_mut(clips[4]).unwrap().1;
+    held.frame_hold = Some(r.tick_of(55));
+    held.reverse = true;
+    let overlapping = place(&mut p, seq, 1, movie, 4, 18);
+    let clip = p.sequence_mut(seq).unwrap().find_item_mut(overlapping).unwrap().1;
+    clip.source_in = r.tick_of(71);
+    clip.speed = 0.75;
+    let still_clip = place(&mut p, seq, 2, still, 0, 30);
+    p.sequence_mut(seq).unwrap().find_item_mut(still_clip).unwrap().1.time_interpolation = filmcraft_project::TimeInterpolation::OpticalFlow;
+    let provider = RequestRecordingProvider {
+        sources,
+        asked: Default::default(),
+        pts: Arc::new((0..400).filter(|i| i % 3 != 2).map(|i| Tick(r.tick_of(i).0 / 2)).collect()),
+    };
+    for (f, source_frame) in [(0, 5), (12, 34), (18, 41), (19, 42), (24, 55), (29, 55)] {
+        let requests = source_frame_requests(&p, seq, r.tick_of(f), RenderOptions::default(), &provider).unwrap();
+        assert_eq!(requests[0].1.time, r.tick_of(source_frame));
+    }
+    let requests = source_frame_requests(&p, seq, r.tick_of(4), RenderOptions::default(), &provider).unwrap();
+    assert_eq!(requests.iter().map(|x| x.0).collect::<Vec<_>>(), [movie, movie, still]);
+    for interpolate in [false, true] {
+        p.sequence_mut(seq).unwrap().find_item_mut(overlapping).unwrap().1.time_interpolation =
+            if interpolate { filmcraft_project::TimeInterpolation::FrameBlending } else { filmcraft_project::TimeInterpolation::FrameSampling };
+        for output_rate in [r, FrameRate::FPS_30] {
+            for scale in [1.0, 0.5] {
+                let opts = RenderOptions { scale, ..Default::default() };
+                let frames = output_rate.frame_at(r.tick_of(30) - Tick(1)) + 1;
+                for f in 0..frames {
+                    let requests = provider.assert_frame_requests(&p, seq, output_rate.tick_of(f), opts);
+                    assert_eq!(requests.last().unwrap().0, still, "bottom-to-top source order");
+                    assert_eq!(requests.iter().filter(|(item, _)| *item == still).count(), 1, "stills never interpolate");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn source_frame_requests_keep_colour_fallback_and_predict_effect_primary() {
+    let (mut p, red, _, seq, sources) = setup();
+    let id = place(&mut p, seq, 0, red, 0, 2);
+    if let ItemKind::Media(media) = &mut p.item_mut(red).unwrap().kind {
+        // RGB with a non-default interpretation cannot use the GPU's YUV input transform.
+        media.interpret.color_space = Some(filmcraft_color::ColorSpace::Linear709);
+    }
+    let provider = RequestRecordingProvider { sources, asked: Default::default(), pts: Arc::new(vec![Tick::ZERO]) };
+    let opts = RenderOptions { scale: 0.025, ..Default::default() };
+    let predicted = plan::source_frame_requests(&p, seq, Tick::ZERO, opts, &provider).unwrap();
+    assert_eq!(predicted.len(), 1);
+    assert!(provider.asked.lock().unwrap().is_empty());
+    let frame_plan = plan::plan_frame(&p, seq, Tick::ZERO, opts, &provider);
+    let requests: Vec<_> = provider.asked.lock().unwrap().iter().map(|&(item, req, _)| (item, req)).collect();
+    assert_eq!(requests, [predicted.clone(), predicted.clone()].concat(), "CPU fallback keeps its original duplicate fetch");
+    let got = plan::execute_cpu(&frame_plan);
+    let reference = render_sequence(&p, seq, Tick::ZERO, opts, &provider);
+    assert_eq!(got.px, reference.px);
+    p.sequence_mut(seq).unwrap().find_item_mut(id).unwrap().1.effects.push(filmcraft_project::find_effect("echo").unwrap().instance());
+    provider.asked.lock().unwrap().clear();
+    for planned in [false, true] {
+        let predicted = if planned {
+            plan::source_frame_requests(&p, seq, Tick::ZERO, opts, &provider)
+        } else {
+            source_frame_requests(&p, seq, Tick::ZERO, opts, &provider)
+        }
+        .unwrap();
+        assert_eq!(predicted.len(), 1);
+        assert!(provider.asked.lock().unwrap().is_empty());
+        if planned {
+            plan::plan_frame(&p, seq, Tick::ZERO, opts, &provider);
+        } else {
+            render_sequence(&p, seq, Tick::ZERO, opts, &provider);
+        }
+        let requests: Vec<_> = provider.asked.lock().unwrap().drain(..).map(|(item, req, _)| (item, req)).collect();
+        assert!(predicted.iter().all(|req| requests.contains(req)), "effects retain primary requests");
+    }
+}
+
+#[test]
+fn source_frame_requests_preserve_transition_order() {
+    let (mut p, red, ocean, seq, sources) = setup();
+    let r = FrameRate::FPS_24;
+    let a = place(&mut p, seq, 0, red, 0, 12);
+    let b = place(&mut p, seq, 0, ocean, 12, 12);
+    p.sequence_mut(seq).unwrap().find_item_mut(b).unwrap().1.source_in = r.tick_of(30);
+    let provider = RequestRecordingProvider { sources, asked: Default::default(), pts: Arc::new((0..100).map(|f| r.tick_of(f)).collect()) };
+    let opts = RenderOptions { scale: 0.025, ..Default::default() };
+    for effect in ["cross_dissolve", "dip_to_black", "push", "iris_round"] {
+        p.sequence_mut(seq).unwrap().video_tracks[0].transitions = vec![filmcraft_project::Transition {
+            id: filmcraft_project::TransitionId(999),
+            effect: filmcraft_project::find_effect(effect).unwrap().instance(),
+            start: r.tick_of(8),
+            duration: r.tick_of(8),
+            from: Some(a),
+            to: Some(b),
+            align: Default::default(),
+            reverse: false,
+        }];
+        for f in 8..16 {
+            provider.assert_frame_requests(&p, seq, r.tick_of(f), opts);
+        }
+    }
+}
+
+#[test]
+fn source_frame_requests_keep_nested_layers_with_captions() {
+    let (mut p, red, ocean, nested, sources) = setup();
+    place(&mut p, nested, 0, red, 0, 2);
+    let settings = p.sequence(nested).unwrap().settings.clone();
+    let outer = p.new_sequence("outer", settings, 2, 0, None);
+    place(&mut p, outer, 0, nested, 0, 2);
+    place(&mut p, outer, 1, ocean, 0, 2);
+    p.sequence_mut(outer).unwrap().caption_tracks.push(filmcraft_project::CaptionTrack::new(
+        filmcraft_project::TrackId(10_000),
+        "captions".into(),
+        filmcraft_project::CaptionFormat::Subtitle,
+    ));
+    let provider = RequestRecordingProvider { sources, asked: Default::default(), pts: Arc::new(vec![Tick::ZERO]) };
+    let opts = RenderOptions { scale: 0.025, captions: true, ..Default::default() };
+    for planned in [false, true] {
+        let predicted = if planned {
+            plan::source_frame_requests(&p, outer, Tick::ZERO, opts, &provider)
+        } else {
+            source_frame_requests(&p, outer, Tick::ZERO, opts, &provider)
+        }
+        .unwrap();
+        assert_eq!(predicted.iter().map(|r| r.0).collect::<Vec<_>>(), [red, ocean]);
+        if planned {
+            plan::plan_frame(&p, outer, Tick::ZERO, opts, &provider);
+        } else {
+            render_sequence(&p, outer, Tick::ZERO, opts, &provider);
+        }
+        let requests: Vec<_> = provider.asked.lock().unwrap().drain(..).map(|(item, req, _)| (item, req)).collect();
+        assert!(predicted.iter().all(|req| requests.contains(req)));
+    }
+}

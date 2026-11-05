@@ -25,6 +25,7 @@ mod pcm;
 mod pipeline;
 pub mod presets;
 mod raster;
+mod schedule;
 pub mod settings;
 pub mod still;
 pub use audio_out::LoudnessReport;

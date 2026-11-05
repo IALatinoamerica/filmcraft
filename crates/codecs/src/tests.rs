@@ -151,6 +151,31 @@ fn h264_mp4_decodes_and_seeks() {
 }
 
 #[test]
+fn mp4_prefetch_preserves_frames() {
+    let Some(bytes) = fixture(
+        "mandel_h264.mp4",
+        &["-f", "lavfi", "-i", "mandelbrot=s=640x360:r=25", "-t", "4", "-c:v", "libx264", "-preset", "fast", "-bf", "3", "-g", "25", "-pix_fmt", "yuv420p"],
+    ) else {
+        return;
+    };
+    for export in [false, true] {
+        filmcraft_media::cancel::with_export(export, || {
+            let plain = crate::open_bytes("mandel_h264.mp4", bytes.clone()).unwrap();
+            let prefetched = crate::open_bytes("mandel_h264.mp4", bytes.clone()).unwrap();
+            let requests: Vec<_> = (3..7).map(|i| FrameRequest::full(plain.info().frame_rate().tick_of(i))).collect();
+            prefetched.prefetch(&requests);
+            for req in requests {
+                let expected = plain.video_frame(req).unwrap();
+                let actual = prefetched.video_frame(req).unwrap();
+                assert_eq!(actual.pts, expected.pts);
+                assert_eq!((actual.width, actual.height, actual.par, actual.color), (expected.width, expected.height, expected.par, expected.color));
+                assert_eq!(yuv_bytes(&actual), yuv_bytes(&expected));
+            }
+        });
+    }
+}
+
+#[test]
 fn prores_mov_decodes() {
     let Some(b) = fixture("bars_prores.mov", &["-f", "lavfi", "-i", "smptehdbars=s=640x360:r=24:d=1", "-c:v", "prores_ks", "-profile:v", "3"]) else { return };
     let src = crate::open_bytes("bars_prores.mov", b).unwrap();
@@ -292,6 +317,45 @@ fn without_default_duration(bytes: &[u8]) -> Vec<u8> {
     out[at + 1] = 0x80 | (total - 2) as u8;
     out[at + 2..at + total].fill(0);
     out
+}
+
+#[test]
+fn matroska_prefetch_preserves_frames() {
+    let Some(bytes) = fixture(
+        "rate25_bf2.mkv",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=25",
+            "-frames:v",
+            "25",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-x264-params",
+            "bframes=2:b-adapt=0:b-pyramid=0:keyint=250:scenecut=0",
+            "-an",
+        ],
+    ) else {
+        return;
+    };
+    for export in [false, true] {
+        filmcraft_media::cancel::with_export(export, || {
+            let plain = crate::open_bytes("rate25_bf2.mkv", bytes.clone()).unwrap();
+            let prefetched = crate::open_bytes("rate25_bf2.mkv", bytes.clone()).unwrap();
+            let requests: Vec<_> = (3..7).map(|i| FrameRequest::full(plain.info().frame_rate().tick_of(i))).collect();
+            prefetched.prefetch(&requests);
+            for req in requests {
+                let expected = plain.video_frame(req).unwrap();
+                let actual = prefetched.video_frame(req).unwrap();
+                assert_eq!(actual.pts, expected.pts);
+                assert_eq!((actual.width, actual.height, actual.par, actual.color), (expected.width, expected.height, expected.par, expected.color));
+                assert_eq!(yuv_bytes(&actual), yuv_bytes(&expected));
+            }
+        });
+    }
 }
 
 #[test]

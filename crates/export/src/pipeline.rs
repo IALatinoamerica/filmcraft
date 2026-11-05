@@ -136,7 +136,7 @@ pub(crate) struct Pipeline {
     pub w: u32,
     pub h: u32,
     geom: Geometry,
-    opts: RenderOptions,
+    pub(crate) opts: RenderOptions,
     pub hdr_out: bool,
     /// Keep straight alpha in the RGBA8 output instead of flattening over black.
     alpha: bool,

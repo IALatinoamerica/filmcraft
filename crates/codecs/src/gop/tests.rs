@@ -869,6 +869,58 @@ fn idle_caches_give_up_their_decoders_beyond_the_cap() {
 }
 
 #[test]
+fn export_pinned_caches_keep_decoders_outside_both_limits() {
+    for idle in [Duration::ZERO, Duration::from_secs(3600)] {
+        let pool = Arc::new(Pool::new(1, idle, FRAME_BUDGET).tiered(Duration::ZERO, 1));
+        let s: Vec<Samples> = (0..4).map(|_| samples(300, 250, 3, false)).collect();
+        let c: Vec<GopCache> = (0..4).map(|_| GopCache::in_pool(None, pool.clone())).collect();
+        // Pin before creating one decoder and after creating the other.
+        c[0].set_export_pinned(true);
+        c[0].frame(&s[0], 10_000).expect("pinned frame");
+        c[1].frame(&s[1], 10_000).expect("frame");
+        c[1].set_export_pinned(true);
+        c[2].frame(&s[2], 10_000).expect("frame");
+        assert_eq!(pool.decoders.load(Ordering::Relaxed), 3);
+        assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 1);
+        assert!(live_decoders_peak() >= 3, "peak includes pinned decoders");
+        c[3].frame(&s[3], 10_000).expect("frame over the limit");
+        assert!(c[2].shared.state.lock().unwrap().decoder.is_none());
+        for k in 0..2 {
+            assert!(c[k].shared.state.lock().unwrap().decoder.is_some());
+            c[k].frame(&s[k], 20_000).expect("continue pinned decoder");
+            assert_eq!(s[k].resets.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(pool.decoders.load(Ordering::Relaxed), 3);
+        drop(c);
+        assert_eq!(pool.decoders.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn export_unpin_is_idempotent_and_makes_decoder_trimmable() {
+    let pool = Arc::new(Pool::new(1, Duration::ZERO, FRAME_BUDGET));
+    let s: Vec<Samples> = (0..3).map(|_| samples(300, 250, 3, false)).collect();
+    let c: Vec<GopCache> = (0..3).map(|_| GopCache::in_pool(None, pool.clone())).collect();
+    c[0].set_export_pinned(true);
+    c[0].frame(&s[0], 10_000).expect("pinned frame");
+    c[0].set_export_pinned(true);
+    c[1].frame(&s[1], 10_000).expect("frame");
+    assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 1);
+    c[0].set_export_pinned(false);
+    assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 2, "one unpin clears repeated pins");
+    c[0].set_export_pinned(false);
+    assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 2);
+    c[2].frame(&s[2], 10_000).expect("frame over the limit");
+    assert!(c[0].shared.state.lock().unwrap().decoder.is_none());
+    assert_eq!(pool.decoders.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 1);
+    drop(c);
+    assert_eq!(pool.decoders.load(Ordering::Relaxed), 0);
+    assert_eq!(pool.unpinned_decoders.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn caches_in_use_keep_their_decoders_whatever_the_cap() {
     // every layer of one composited frame was asked moments ago: none is idle
     let pool = Arc::new(Pool::new(2, Duration::from_secs(3600), FRAME_BUDGET));

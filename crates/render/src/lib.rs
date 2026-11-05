@@ -30,6 +30,7 @@ pub mod plan;
 pub mod preview;
 pub mod remix;
 pub mod scene;
+mod source_requests;
 mod stretch;
 pub mod track;
 pub mod transitions;
@@ -42,9 +43,11 @@ use filmcraft_geom::{Affine, Vec2};
 use filmcraft_media::{FrameRequest, SharedSource};
 use filmcraft_project::{ItemId, ItemKind, ParamValue, Project, Sequence, TrackItem};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
+use source_requests::{TrackLayer, track_layer_at};
 
 pub use blend::Blend;
 pub use image::Image;
+pub use source_requests::source_frame_requests;
 
 /// Resolves project items to media sources (the engine owns the media pool).
 pub trait SourceProvider: Sync {
@@ -240,9 +243,8 @@ fn seq_canvas(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, s
             continue;
         }
         // transition covering t?
-        if let Some(tr) = track.transitions.iter().find(|tr| tr.range().contains(t)) {
-            let a = tr.from.and_then(|id| track.item(id)).filter(|i| i.enabled);
-            let b = tr.to.and_then(|id| track.item(id)).filter(|i| i.enabled);
+        let layer = track_layer_at(track, t);
+        if let Some(TrackLayer::Transition(tr, a, b)) = layer {
             // An adjustment layer has no picture of its own: in a transition it is the frame below
             // with its effects, so a dissolve fades the effects in or out.
             let layer = |i: &TrackItem, below: &Image| -> Option<(Image, Blend)> {
@@ -273,10 +275,7 @@ fn seq_canvas(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, s
             blend::composite(canvas.get(), &mixed, 1.0, bl);
             continue;
         }
-        let Some(item) = track.item_at(t) else { continue };
-        if !item.enabled {
-            continue;
-        }
+        let Some(TrackLayer::Item(item)) = layer else { continue };
         if is_adjustment(project, item) {
             if !opts.effects {
                 continue;
@@ -538,8 +537,7 @@ pub(crate) fn item_layer_ex(
     let src_size = source_size(project, item.item)?;
     let motion = motion_matrix(seq, item, src_size, source_par(project, item.item), mt);
     // How many output pixels one source pixel covers → request a reduced frame when possible.
-    let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
-    let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
+    let want = source_scale(&motion, opts.scale);
     let pi = project.item(item.item)?;
     if matches!(pi.kind, ItemKind::Graphic { .. }) && !(item.has_opacity_masks() || opts.effects && item.has_standard_effects()) {
         // vectors straight to the output: no resampling, crisp at any Motion scale
@@ -633,7 +631,7 @@ fn plain_layer(frame: &Arc<VideoFrame>, n: usize, opacity: f32, blend: Blend) ->
 /// convert it with.
 fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f32, src_size: (u32, u32)) -> Option<(SharedSource, Arc<VideoFrame>, usize)> {
     let src = sources.source(item.item)?;
-    let frame = src.video_frame(FrameRequest { time: video_source_time(item, t, src.info().frame_rate()), scale: want }).ok()?;
+    let frame = src.video_frame(video_frame_request(item, t, src.info().frame_rate(), want)).ok()?;
     let n = decimation(frame.width as f32, src_size.0 as f32 * want);
     Some((src, frame, n))
 }
@@ -649,6 +647,18 @@ pub(crate) fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft
         return ft;
     }
     media_rate.tick_of(media_rate.frame_at(ft)).clamp(item.source_in.min(ft), ft)
+}
+
+/// The renderer's primary request for a media clip at timeline `t`. VFR sample/PTS lookup
+/// stays in `MediaSource::video_frame`; the request is passed to it unchanged.
+/// Time Remapping keyframes follow `TrackItem::source_time_at` (currently ignored).
+pub fn video_frame_request(item: &TrackItem, t: Tick, media_rate: filmcraft_time::FrameRate, scale: f32) -> FrameRequest {
+    FrameRequest { time: video_source_time(item, t, media_rate), scale }
+}
+
+fn source_scale(motion: &Affine, scale: f32) -> f32 {
+    let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
+    (lin * scale as f64).clamp(1.0 / 64.0, 1.0) as f32
 }
 
 /// A decoded media frame with the source it came from and its decode index.
