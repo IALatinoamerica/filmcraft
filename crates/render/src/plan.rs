@@ -6,7 +6,7 @@
 //! clip whose enabled standard effects all have a GPU implementation ([`crate::gpufx`]) carries
 //! them as a [`LayerFx`]: their parameters evaluated at the frame's time, run by the GPU on the
 //! clip's working image before Motion places it, in the CPU's order (effects → Motion → Opacity /
-//! blend). Anything the shaders don't cover yet — other standard effects, masks, adjustment
+//! blend). Anything the shaders don't cover yet — other standard effects, masks, unsupported adjustment
 //! layers, nested sequences, transitions other than dissolves, dips and Push — is rendered on the CPU
 //! for that layer (or the whole frame) and handed over as a pre-composited image, so the GPU path
 //! is always exact with respect to the CPU reference.
@@ -92,7 +92,6 @@ pub enum FramePlan {
 pub enum PlanStep {
     Layers(Vec<PlanLayer>),
     /// Apply enabled, non-intrinsic effects to the canvas so far, then mix by weight and blend.
-    /// Reserved for the adjustment planner; executors currently fall back for this step.
     Adjust {
         effects: Vec<EffectInstance>,
         time: Tick,
@@ -253,6 +252,34 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
     Some(chain)
 }
 
+/// Stage 1 adjustment effects, evaluated on the output canvas at the item's effect time.
+/// Shared by whole-frame classification and the Adjust producer.
+fn adjustment_chain(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, scale: f32) -> Option<Vec<EffectInstance>> {
+    if item.has_opacity_masks() || item.effects.iter().any(|e| e.enabled && e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None)) {
+        return None;
+    }
+    let (w, h) = output_size(seq, scale);
+    let cx = crate::effects::FxCtx {
+        t: item.effect_time_at(t),
+        px_scale: scale,
+        seconds: (t - item.start).seconds(),
+        timecode: "",
+        clip_name: &item.name,
+        project: Some(project),
+        env: None,
+        frame_rate: seq.settings.frame_rate.as_f64(),
+        working: seq.settings.color.working,
+    };
+    let mut effects = Vec::new();
+    for e in item.effects.iter().filter(|e| e.enabled && !e.def().is_some_and(|d| d.intrinsic)) {
+        if !matches!(e.effect.as_str(), "transform" | "offset" | "directional_blur") || !FxOp::eval(e, &cx, w, h).is_some_and(|op| op.gpu_ok()) {
+            return None;
+        }
+        effects.push(e.clone());
+    }
+    Some(effects)
+}
+
 /// Plan the frame at timeline `t`.
 pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> FramePlan {
     let Some(seq) = project.sequence(seq_id) else { return FramePlan::Image(crate::Image::new(1, 1)) };
@@ -319,13 +346,13 @@ pub fn cpu_frame_reason(project: &Project, seq_id: ItemId, t: Tick) -> Option<Cp
 }
 
 /// The frames [`plan_frame`] does not plan: an HDR / wide-gamut sequence composites and converts
-/// on the CPU, and so does a frame with an adjustment layer or a complex transition anywhere at
+/// on the CPU, and so does a frame with an unsupported adjustment layer or a complex transition at
 /// `t` (whole-frame fallback).
 fn whole_frame_on_cpu(project: &Project, seq: &Sequence, t: Tick) -> bool {
     !seq.settings.color.is_plain() || !layered_at(project, seq, t)
 }
 
-/// Whether the frame of `seq` at `t` can be planned as layers: no adjustment layer and no
+/// Whether the frame of `seq` at `t` can be planned as layers: no unsupported adjustment layer and no
 /// transition the compositor cannot mix itself is showing (a transition into or out of an
 /// adjustment layer counts, also on the side of the cut where the other clip is).
 pub(crate) fn layered_at(project: &Project, seq: &Sequence, t: Tick) -> bool {
@@ -346,8 +373,9 @@ fn layered_cpu_reason(project: &Project, seq: &Sequence, t: Tick) -> Option<CpuF
                 return Some(CpuFrameReason::Adjustment);
             }
         }
-        if let Some(it) = tr.item_at(t)
+        if let Some(it) = tr.item_at(t).filter(|it| it.enabled)
             && adjustment(it)
+            && adjustment_chain(project, seq, it, t, 1.0).is_none()
         {
             return Some(CpuFrameReason::Adjustment);
         }
@@ -429,8 +457,10 @@ fn nest_is_plain(project: &Project, seq: &Sequence, nested: &Sequence, ft: Tick)
         && layered_at(project, nested, ft)
         && !nested.video_tracks.iter().any(|tr| tr.enabled && tr.transitions.iter().any(|t| t.range().contains(ft) && !simple_transition(&t.effect.effect)))
         && nested.video_tracks.iter().filter(|tr| tr.enabled).all(|tr| {
-            tr.transitions.iter().any(|x| x.range().contains(ft))
-                || tr.item_at(ft).filter(|i| i.enabled).is_none_or(|i| crate::opacity_blend(i, i.effect_time_at(ft)).1 == Blend::Normal)
+            // Adjustments must stay inside the nested canvas, away from outer lower tracks.
+            tr.item_at(ft).filter(|i| i.enabled).is_none_or(|i| !crate::is_adjustment(project, i))
+                && (tr.transitions.iter().any(|x| x.range().contains(ft))
+                    || tr.item_at(ft).filter(|i| i.enabled).is_none_or(|i| crate::opacity_blend(i, i.effect_time_at(ft)).1 == Blend::Normal))
         })
 }
 
@@ -460,6 +490,23 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
     let mt = item.effect_time_at(t);
     let (op, own) = crate::opacity_blend(item, mt);
     let bl = blend.unwrap_or(own);
+    if crate::is_adjustment(project, item) {
+        if !opts.effects {
+            return;
+        }
+        let Some(effects) = adjustment_chain(project, seq, item, t, opts.scale) else {
+            out.exhausted = true;
+            return;
+        };
+        let size = crate::source_size(project, item.item).unwrap_or((seq.settings.width, seq.settings.height));
+        let motion = motion_matrix(seq, item, size, crate::source_par(project, item.item), mt);
+        let s = opts.scale as f64;
+        let frame_size = (((size.0 as f64 * s).round() as usize).max(1), ((size.1 as f64 * s).round() as usize).max(1));
+        let matrix = Affine::scale(s, s).then_apply(&motion).then_apply(&Affine::scale(1.0 / s, 1.0 / s));
+        let weight = AdjustWeight { opacity: op * extra_opacity, frame_size, matrix, px_scale: opts.scale };
+        out.steps.push(PlanStep::Adjust { effects, time: mt, weight, blend: bl });
+        return;
+    }
     // A multi-camera clip that only shows its angle (no effects, untransformed, same frame size)
     // draws the angle's clip directly: no CPU pass over the nested sequence.
     if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
@@ -470,7 +517,7 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
         && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), Some(nested.settings.par), mt))
         && let Some(tr) = nested.angle_video_track_index(angle).and_then(|i| nested.video_tracks.get(i))
         && !tr.transitions.iter().any(|x| x.range().contains(ft))
-        && tr.item_at(ft).is_none_or(|i| crate::opacity_blend(i, i.effect_time_at(ft)).1 != Blend::Dissolve)
+        && tr.item_at(ft).is_none_or(|i| !crate::is_adjustment(project, i) && crate::opacity_blend(i, i.effect_time_at(ft)).1 != Blend::Dissolve)
     {
         // Inside the nested sequence the angle's clip is composited onto an empty canvas, where
         // every mode but Dissolve is Normal; the multicam clip's own mode then applies to it.
@@ -631,9 +678,38 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
             for step in steps {
                 match step {
                     PlanStep::Layers(layers) => execute_layers(&mut canvas, layers),
-                    // This image-returning API uses an empty image for unavailable rendering.
-                    // Do not return a partially rendered canvas for an unsupported adjustment.
-                    PlanStep::Adjust { .. } => return crate::Image::new(*width, *height),
+                    PlanStep::Adjust { effects, time, weight, blend } => {
+                        let mut adj = canvas.clone();
+                        // The Stage 1 effects consume only effect time and pixel scale. Shutter
+                        // blur (which needs frame_rate) is rejected by adjustment_chain.
+                        let cx = crate::effects::FxCtx {
+                            t: *time,
+                            px_scale: weight.px_scale,
+                            seconds: 0.0,
+                            timecode: "",
+                            clip_name: "",
+                            project: None,
+                            env: None,
+                            frame_rate: 0.0,
+                            working: filmcraft_color::WorkingSpace::Rec709,
+                        };
+                        for e in effects {
+                            crate::mask::apply_effect(&mut adj, e, &cx);
+                        }
+                        let mut coverage = crate::Image::filled(*width, *height, [weight.opacity; 4]);
+                        if let Some(region) = crate::adjustment_coverage(weight.frame_size, &weight.matrix, *width, *height) {
+                            let cov: Vec<f32> = region.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+                            crate::mask::scale_by(&mut coverage, &cov);
+                        }
+                        let cov: Vec<f32> = coverage.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+                        if *blend == Blend::Normal {
+                            crate::mask::mix(&mut adj, &canvas, &cov);
+                            canvas = adj;
+                        } else {
+                            crate::mask::scale_by(&mut adj, &cov);
+                            crate::blend::composite(&mut canvas, &adj, 1.0, *blend);
+                        }
+                    }
                     PlanStep::Transition { inputs, effect, progress, scale } => {
                         let [a, b] = inputs.each_ref().map(|layers| {
                             let mut input = crate::Image::new(*width, *height);

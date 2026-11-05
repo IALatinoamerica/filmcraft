@@ -363,3 +363,137 @@ fn basic_3d_keeps_its_perspective_at_every_render_scale() {
         }
     }
 }
+
+/// A small picture over a different matte makes displacement and blur observable.
+fn oracle_scene(effect: &str) -> (Scene, ClipId) {
+    let mut s = scene(4);
+    let dark = matte(&mut s.p, &mut s.map, [0.1, 0.2, 0.3, 1.0]);
+    let red = matte(&mut s.p, &mut s.map, [1.0, 0.0, 0.0, 1.0]);
+    place(&mut s.p, s.seq, 0, dark);
+    let picture = place(&mut s.p, s.seq, 1, red);
+    clip(&mut s, picture).effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(40.0);
+    let adj = adjustment(&mut s.p, s.seq, 2);
+    fx(&mut s, adj, effect);
+    (s, adj)
+}
+
+fn oracle_matches(s: &Scene, scale: f32, adjustments: usize) -> Image {
+    use crate::plan::{FramePlan, PlanStep, cpu_frame_reason, execute_cpu, is_cpu_frame, plan_frame};
+    let t = R.tick_of(12);
+    let opts = RenderOptions { scale, ..Default::default() };
+    assert!(!is_cpu_frame(&s.p, s.seq, t));
+    assert_eq!(cpu_frame_reason(&s.p, s.seq, t), None);
+    let plan = plan_frame(&s.p, s.seq, t, opts, &s.map);
+    let FramePlan::Composite { steps, .. } = &plan else { panic!("expected an adjustment plan") };
+    assert_eq!(steps.iter().filter(|s| matches!(s, PlanStep::Adjust { .. })).count(), adjustments);
+    let expected = if scale == 1.0 { render(s) } else { render_sequence(&s.p, s.seq, t, opts, &s.map) };
+    let actual = execute_cpu(&plan);
+    assert_eq!((actual.w, actual.h), (expected.w, expected.h));
+    assert_eq!(actual.px, expected.px);
+    actual
+}
+
+#[test]
+fn planned_adjustment_keyframed_zoom_and_pan_matches_cpu() {
+    use filmcraft_project::{Interpolation, Keyframe};
+    let (mut s, adj) = oracle_scene("transform");
+    let transform = clip(&mut s, adj).effect_mut("transform").unwrap();
+    for (id, a, b) in [
+        ("scale_height", ParamValue::Float(100.0), ParamValue::Float(160.0)),
+        ("position", ParamValue::Vec2(Vec2::new(160.0, 90.0)), ParamValue::Vec2(Vec2::new(204.0, 108.0))),
+    ] {
+        let mut first = Keyframe::new(Tick::ZERO, a);
+        first.interp = Interpolation::Bezier;
+        first.out_influence = 0.6;
+        transform.params.get_mut(id).unwrap().keyframes = vec![first, Keyframe::new(R.tick_of(24), b)];
+    }
+    oracle_matches(&s, 1.0, 1);
+    oracle_matches(&s, 0.5, 1);
+}
+
+#[test]
+fn planned_adjustment_offset_matches_cpu() {
+    let (mut s, adj) = oracle_scene("offset");
+    clip(&mut s, adj).effect_mut("offset").unwrap().params.get_mut("shift").unwrap().value = ParamValue::Vec2(Vec2::new(207.5, 108.0));
+    // An ordinary layer above the adjustment remains a separate later step.
+    let blue = matte(&mut s.p, &mut s.map, [0.0, 0.0, 1.0, 1.0]);
+    let top = place(&mut s.p, s.seq, 3, blue);
+    clip(&mut s, top).effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(10.0);
+    oracle_matches(&s, 1.0, 1);
+    oracle_matches(&s, 0.5, 1);
+}
+
+#[test]
+fn planned_adjustment_directional_blur_matches_cpu() {
+    let (mut s, adj) = oracle_scene("directional_blur");
+    let blur = clip(&mut s, adj).effect_mut("directional_blur").unwrap();
+    blur.params.get_mut("length").unwrap().value = ParamValue::Float(17.0);
+    blur.params.get_mut("direction").unwrap().value = ParamValue::Float(35.0);
+    oracle_matches(&s, 1.0, 1);
+    oracle_matches(&s, 0.5, 1);
+}
+
+#[test]
+fn planned_adjustment_partial_opacity_matches_cpu() {
+    let (mut s, adj) = oracle_scene("offset");
+    clip(&mut s, adj).effect_mut("offset").unwrap().params.get_mut("shift").unwrap().value = ParamValue::Vec2(Vec2::new(210.0, 115.0));
+    clip(&mut s, adj).effect_mut("opacity").unwrap().params.get_mut("opacity").unwrap().value = ParamValue::Float(37.0);
+    oracle_matches(&s, 1.0, 1);
+}
+
+#[test]
+fn planned_adjustment_motion_scaled_frame_matches_cpu() {
+    let (mut s, adj) = oracle_scene("offset");
+    clip(&mut s, adj).effect_mut("offset").unwrap().params.get_mut("shift").unwrap().value = ParamValue::Vec2(Vec2::new(224.0, 90.0));
+    let motion = clip(&mut s, adj).effect_mut("motion").unwrap();
+    motion.params.get_mut("scale").unwrap().value = ParamValue::Float(53.0);
+    motion.params.get_mut("position").unwrap().value = ParamValue::Vec2(Vec2::new(143.5, 81.0));
+    motion.params.get_mut("rotation").unwrap().value = ParamValue::Float(12.0);
+    oracle_matches(&s, 1.0, 1);
+    oracle_matches(&s, 0.5, 1);
+}
+
+#[test]
+fn planned_adjustment_non_normal_blend_matches_cpu() {
+    let (mut s, adj) = oracle_scene("offset");
+    clip(&mut s, adj).effect_mut("offset").unwrap().params.get_mut("shift").unwrap().value = ParamValue::Vec2(Vec2::new(200.0, 90.0));
+    let opacity = clip(&mut s, adj).effect_mut("opacity").unwrap();
+    opacity.params.get_mut("opacity").unwrap().value = ParamValue::Float(65.0);
+    opacity.params.get_mut("blend").unwrap().value =
+        ParamValue::Choice(filmcraft_project::effect::BLEND_MODES.iter().position(|b| *b == "Multiply").unwrap() as u32);
+    oracle_matches(&s, 1.0, 1);
+}
+
+#[test]
+fn planned_stacked_adjustment_layers_match_cpu() {
+    let (mut s, first) = oracle_scene("transform");
+    clip(&mut s, first).effect_mut("transform").unwrap().params.get_mut("scale_height").unwrap().value = ParamValue::Float(125.0);
+    let second = adjustment(&mut s.p, s.seq, 3);
+    fx(&mut s, second, "offset");
+    clip(&mut s, second).effect_mut("offset").unwrap().params.get_mut("shift").unwrap().value = ParamValue::Vec2(Vec2::new(192.0, 100.0));
+    oracle_matches(&s, 1.0, 2);
+}
+
+#[test]
+fn planned_adjustment_transform_replaces_empty_areas_1524() {
+    let (mut s, adj) = oracle_scene("transform");
+    clip(&mut s, adj).effect_mut("transform").unwrap().params.get_mut("position").unwrap().value = ParamValue::Vec2(Vec2::new(224.0, 90.0));
+    let full = oracle_matches(&s, 1.0, 1);
+    assert_eq!(full.get(10, 10), [0.0; 4], "the untransformed picture must disappear");
+    clip(&mut s, adj).effect_mut("opacity").unwrap().params.get_mut("opacity").unwrap().value = ParamValue::Float(50.0);
+    let half = oracle_matches(&s, 1.0, 1);
+    assert_eq!(half.get(10, 10)[3], 0.5);
+}
+
+#[test]
+fn masked_adjustment_stays_a_whole_cpu_frame() {
+    use crate::plan::{CpuFrameReason, FramePlan, cpu_frame_reason, is_cpu_frame, plan_frame};
+    let (mut s, adj) = oracle_scene("offset");
+    let effect = clip(&mut s, adj).effect_mut("offset").unwrap();
+    effect.params.get_mut("shift").unwrap().value = ParamValue::Vec2(Vec2::new(224.0, 90.0));
+    effect.masks.push(Mask::new("effect mask", MaskPath::rect(0.0, 0.0, 160.0, 180.0)));
+    let t = R.tick_of(12);
+    assert!(is_cpu_frame(&s.p, s.seq, t));
+    assert_eq!(cpu_frame_reason(&s.p, s.seq, t), Some(CpuFrameReason::Adjustment));
+    assert!(matches!(plan_frame(&s.p, s.seq, t, RenderOptions::default(), &s.map), FramePlan::Image(_)));
+}

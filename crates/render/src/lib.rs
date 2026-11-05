@@ -384,6 +384,11 @@ fn adjustment_region(seq: &Sequence, item: &TrackItem, project: &Project, mt: Ti
     let s = scale as f64;
     let (fw, fh) = (((size.0 as f64 * s).round() as usize).max(1), ((size.1 as f64 * s).round() as usize).max(1));
     let m = Affine::scale(s, s).then_apply(&motion).then_apply(&Affine::scale(1.0 / s, 1.0 / s));
+    adjustment_coverage((fw, fh), &m, w, h)
+}
+
+/// Rasterise the resolved adjustment frame, preserving the full-coverage shortcut.
+fn adjustment_coverage((fw, fh): (usize, usize), m: &Affine, w: usize, h: usize) -> Option<Image> {
     let full = fw == w
         && fh == h
         && (m.a - 1.0).abs() < 1e-9
@@ -395,7 +400,7 @@ fn adjustment_region(seq: &Sequence, item: &TrackItem, project: &Project, mt: Ti
     if full {
         return None;
     }
-    Some(Image::filled(fw, fh, [1.0; 4]).transformed(w, h, &m))
+    Some(Image::filled(fw, fh, [1.0; 4]).transformed(w, h, m))
 }
 
 /// Rendered captions of the visible caption tracks at `t` for a `w`×`h` output.
