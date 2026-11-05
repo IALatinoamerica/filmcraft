@@ -33,6 +33,22 @@ pub fn decode_json() -> Value {
         "decodeMs": g.decode_ns as f64 / 1e6,
         "decodeMsPerSample": g.decode_ms_per_sample(),
         "framesDecoded": g.frames,
+        // VA-API timings, frame use, seek reasons, lock waits, and peak live decoders (not a sum).
+        "submitMs": hw.submit_ns as f64 / 1e6,
+        "syncMs": hw.sync_ns as f64 / 1e6,
+        "getImageMs": hw.get_image_ns as f64 / 1e6,
+        "copyMs": hw.copy_ns as f64 / 1e6,
+        "readbacks": hw.readbacks,
+        "usedFrames": g.used_frames,
+        "seeksBy": {
+            "cutIn": g.seeks_by_cut_in,
+            "evictedFrame": g.seeks_by_evicted_frame,
+            "decoderRecycled": g.seeks_by_decoder_recycled,
+            "outOfOrder": g.seeks_by_out_of_order,
+            "other": g.seeks_by_other,
+        },
+        "lockWaitMs": g.lock_wait_ns as f64 / 1e6,
+        "liveDecodersPeak": filmcraft_codecs::live_decoders_peak(),
         // Settings ▸ Playback ▸ Hardware decoding: pictures from OS hardware decoders vs ours,
         // hardware decoders created, streams handed to software up front, mid-stream fallbacks.
         "hardware": {
@@ -95,6 +111,14 @@ mod tests {
             "decodeMs",
             "decodeMsPerSample",
             "framesDecoded",
+            "submitMs",
+            "syncMs",
+            "getImageMs",
+            "copyMs",
+            "readbacks",
+            "usedFrames",
+            "lockWaitMs",
+            "liveDecodersPeak",
             "liveDecoders",
             "cacheMB",
             "cacheBudgetMB",
@@ -102,6 +126,9 @@ mod tests {
             "planesReused",
         ] {
             assert!(v["decode"][k].is_number(), "decode.{k} in {v}");
+        }
+        for k in ["cutIn", "evictedFrame", "decoderRecycled", "outOfOrder", "other"] {
+            assert!(v["decode"]["seeksBy"][k].is_number(), "decode.seeksBy.{k} in {v}");
         }
         for k in ["frames", "softwareFrames", "sessions", "declined", "fallbacks"] {
             assert!(v["decode"]["hardware"][k].is_number(), "decode.hardware.{k} in {v}");

@@ -57,12 +57,27 @@ pub struct HwStats {
     pub declined: u64,
     /// Hardware decoders that failed mid-stream and continued in software.
     pub fallbacks: u64,
+    /// Wall time from VA-API picture submission begin to end, in nanoseconds.
+    pub submit_ns: u64,
+    /// Wall time blocked in VA-API surface synchronisation, in nanoseconds.
+    pub sync_ns: u64,
+    /// Wall time copying VA-API surfaces into images, in nanoseconds.
+    pub get_image_ns: u64,
+    /// Wall time mapping, copying and unmapping VA-API images, in nanoseconds.
+    pub copy_ns: u64,
+    /// Pictures requested for readback through VA-API.
+    pub readbacks: u64,
 }
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
 static DECLINED: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+static SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static GET_IMAGE_NS: AtomicU64 = AtomicU64::new(0);
+static COPY_NS: AtomicU64 = AtomicU64::new(0);
+static READBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// The counters so far.
 pub fn hw_stats() -> HwStats {
@@ -71,6 +86,11 @@ pub fn hw_stats() -> HwStats {
         sessions: SESSIONS.load(Ordering::Relaxed),
         declined: DECLINED.load(Ordering::Relaxed),
         fallbacks: FALLBACKS.load(Ordering::Relaxed),
+        submit_ns: SUBMIT_NS.load(Ordering::Relaxed),
+        sync_ns: SYNC_NS.load(Ordering::Relaxed),
+        get_image_ns: GET_IMAGE_NS.load(Ordering::Relaxed),
+        copy_ns: COPY_NS.load(Ordering::Relaxed),
+        readbacks: READBACKS.load(Ordering::Relaxed),
     }
 }
 
@@ -92,6 +112,31 @@ pub fn note_hw_declined() {
 /// A hardware decoder switched to software mid-stream.
 pub fn note_hw_fallback() {
     FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A VA-API picture submission took `ns` nanoseconds.
+pub fn note_hw_submit(ns: u64) {
+    SUBMIT_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// A VA-API surface synchronisation took `ns` nanoseconds.
+pub fn note_hw_sync(ns: u64) {
+    SYNC_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// A VA-API surface-to-image copy took `ns` nanoseconds.
+pub fn note_hw_get_image(ns: u64) {
+    GET_IMAGE_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// A VA-API image map, copy and unmap took `ns` nanoseconds.
+pub fn note_hw_copy(ns: u64) {
+    COPY_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// A picture was requested for readback through VA-API.
+pub fn note_hw_readback() {
+    READBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The two codecs whose `avcC` / `hvcC` streams hardware decoders take.
@@ -396,6 +441,27 @@ impl NalStreamInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hw_timing_counters_grow() {
+        let before = hw_stats();
+        note_hw_submit(11);
+        note_hw_sync(13);
+        note_hw_get_image(17);
+        note_hw_copy(19);
+        note_hw_readback();
+        let after = hw_stats();
+
+        assert!(after.submit_ns >= before.submit_ns + 11);
+        assert!(after.sync_ns >= before.sync_ns + 13);
+        assert!(after.get_image_ns >= before.get_image_ns + 17);
+        assert!(after.copy_ns >= before.copy_ns + 19);
+        assert!(after.readbacks > before.readbacks);
+        assert!(after.frames >= before.frames);
+        assert!(after.sessions >= before.sessions);
+        assert!(after.declined >= before.declined);
+        assert!(after.fallbacks >= before.fallbacks);
+    }
 
     #[test]
     fn switch_defaults_to_auto() {

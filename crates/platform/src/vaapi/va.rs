@@ -12,7 +12,9 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
+use filmcraft_codecs::hw::{note_hw_copy, note_hw_get_image, note_hw_readback, note_hw_submit, note_hw_sync};
 use filmcraft_frame::VideoFrame;
 use libloading::Library;
 
@@ -384,9 +386,13 @@ impl Session {
             buffers.push(self.buffer(ffi::VASliceDataBufferType, data.as_ptr().cast(), data.len())?);
         }
         let api = self.display.api;
+        let started = Instant::now();
         // SAFETY: `surface` is one of this context's render targets.
         let st = unsafe { (api.begin_picture)(self.display.dpy, self.context, surface) };
-        self.display.check(st, "vaBeginPicture")?;
+        if let Err(e) = self.display.check(st, "vaBeginPicture") {
+            note_hw_submit(started.elapsed().as_nanos() as u64);
+            return Err(e);
+        }
         let (picture, slice_buffers) = buffers.split_at_mut(head);
         let mut rendered = self.render(picture);
         for pair in slice_buffers.chunks_mut(2) {
@@ -398,6 +404,7 @@ impl Session {
         // a begun picture is always ended, so the context stays usable
         // SAFETY: the picture was begun on this context above.
         let st = unsafe { (api.end_picture)(self.display.dpy, self.context) };
+        note_hw_submit(started.elapsed().as_nanos() as u64);
         rendered?;
         self.display.check(st, "vaEndPicture")
     }
@@ -422,11 +429,15 @@ impl Session {
         let surface = *self.surfaces.get(index).ok_or("surface out of range")?;
         let image = self.image()?;
         let api = self.display.api;
+        let started = Instant::now();
         // SAFETY: `surface` is one of this session's surfaces.
         let st = unsafe { (api.sync_surface)(self.display.dpy, surface) };
+        note_hw_sync(started.elapsed().as_nanos() as u64);
         self.display.check(st, "vaSyncSurface")?;
+        let started = Instant::now();
         // SAFETY: the image and the surface were made on this display, with the same size.
         let st = unsafe { (api.get_image)(self.display.dpy, surface, 0, 0, self.size.0, self.size.1, image.image_id) };
+        note_hw_get_image(started.elapsed().as_nanos() as u64);
         self.display.check(st, "vaGetImage")?;
         Ok(image)
     }
@@ -470,24 +481,29 @@ impl Session {
     }
 
     fn read_image(&self, image: &VAImage) -> Result<VideoFrame, String> {
-        let api = self.display.api;
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `image.buf` is the data buffer of an image made on this display; `ptr` is a live output.
-        let st = unsafe { (api.map_buffer)(self.display.dpy, image.buf, &mut ptr) };
-        self.display.check(st, "vaMapBuffer")?;
-        let result = if ptr.is_null() {
-            Err("vaMapBuffer returned no data".to_string())
-        } else {
-            // SAFETY: a mapped image buffer holds `data_size` bytes at `ptr` until it is unmapped
-            // below; the slice does not outlive this block.
-            let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().cast_const(), image.data_size as usize) };
-            biplanar_view(image, data).and_then(|b| biplanar::to_frame(&b, &self.geometry))
-        };
-        // SAFETY: the buffer was mapped above; `data` is no longer used.
-        let st = unsafe { (api.unmap_buffer)(self.display.dpy, image.buf) };
-        let frame = result?;
-        self.display.check(st, "vaUnmapBuffer")?;
-        Ok(frame)
+        let started = Instant::now();
+        let result = (|| {
+            let api = self.display.api;
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `image.buf` is the data buffer of an image made on this display; `ptr` is a live output.
+            let st = unsafe { (api.map_buffer)(self.display.dpy, image.buf, &mut ptr) };
+            self.display.check(st, "vaMapBuffer")?;
+            let result = if ptr.is_null() {
+                Err("vaMapBuffer returned no data".to_string())
+            } else {
+                // SAFETY: a mapped image buffer holds `data_size` bytes at `ptr` until it is unmapped
+                // below; the slice does not outlive this block.
+                let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().cast_const(), image.data_size as usize) };
+                biplanar_view(image, data).and_then(|b| biplanar::to_frame(&b, &self.geometry))
+            };
+            // SAFETY: the buffer was mapped above; `data` is no longer used.
+            let st = unsafe { (api.unmap_buffer)(self.display.dpy, image.buf) };
+            let frame = result?;
+            self.display.check(st, "vaUnmapBuffer")?;
+            Ok(frame)
+        })();
+        note_hw_copy(started.elapsed().as_nanos() as u64);
+        result
     }
 }
 
@@ -531,6 +547,7 @@ impl Accel for Session {
     }
 
     fn read(&mut self, index: usize) -> Result<VideoFrame, String> {
+        note_hw_readback();
         let image = self.get_image(index)?;
         self.read_image(&image)
     }

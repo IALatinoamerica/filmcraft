@@ -4,7 +4,7 @@
 //! from the preceding sync sample, and cache every decoded frame (keyed by pts). Playback requests
 //! for the next frames therefore hit the cache or continue the running decoder without re-seeking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 use std::time::Duration;
@@ -39,6 +39,20 @@ pub struct GopStats {
     /// Pictures decoders output (hardware and software; [`crate::hw::hw_stats`] counts the
     /// hardware ones).
     pub frames: u64,
+    /// Decoded pictures returned to callers at least once.
+    pub used_frames: u64,
+    /// Restarts after this cache's decoder was released and recreated.
+    pub seeks_by_decoder_recycled: u64,
+    /// Restarts for previously decoded, evicted pictures.
+    pub seeks_by_evicted_frame: u64,
+    /// Restarts for samples behind the running decoder.
+    pub seeks_by_out_of_order: u64,
+    /// Restarts for a cache's first request or a far forward jump.
+    pub seeks_by_cut_in: u64,
+    /// Restarts not covered by the other seek causes.
+    pub seeks_by_other: u64,
+    /// Wall time waiting for request-path cache state locks, nanoseconds.
+    pub lock_wait_ns: u64,
 }
 
 impl GopStats {
@@ -63,6 +77,14 @@ static DECODE_NS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static DRAFT: AtomicU64 = AtomicU64::new(0);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
+static USED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static SEEKS_BY_DECODER_RECYCLED: AtomicU64 = AtomicU64::new(0);
+static SEEKS_BY_EVICTED_FRAME: AtomicU64 = AtomicU64::new(0);
+static SEEKS_BY_OUT_OF_ORDER: AtomicU64 = AtomicU64::new(0);
+static SEEKS_BY_CUT_IN: AtomicU64 = AtomicU64::new(0);
+static SEEKS_BY_OTHER: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static LIVE_DECODERS_PEAK: AtomicUsize = AtomicUsize::new(0);
 
 /// Count pictures a decoder call output.
 fn count_frames<T>(out: &[T]) {
@@ -89,6 +111,13 @@ pub fn gop_stats() -> GopStats {
         skipped: SKIPPED.load(Ordering::Relaxed),
         draft: DRAFT.load(Ordering::Relaxed),
         frames: FRAMES.load(Ordering::Relaxed),
+        used_frames: USED_FRAMES.load(Ordering::Relaxed),
+        seeks_by_decoder_recycled: SEEKS_BY_DECODER_RECYCLED.load(Ordering::Relaxed),
+        seeks_by_evicted_frame: SEEKS_BY_EVICTED_FRAME.load(Ordering::Relaxed),
+        seeks_by_out_of_order: SEEKS_BY_OUT_OF_ORDER.load(Ordering::Relaxed),
+        seeks_by_cut_in: SEEKS_BY_CUT_IN.load(Ordering::Relaxed),
+        seeks_by_other: SEEKS_BY_OTHER.load(Ordering::Relaxed),
+        lock_wait_ns: LOCK_WAIT_NS.load(Ordering::Relaxed),
     }
 }
 
@@ -105,6 +134,13 @@ impl std::ops::Sub for GopStats {
             skipped: self.skipped - o.skipped,
             draft: self.draft - o.draft,
             frames: self.frames - o.frames,
+            used_frames: self.used_frames - o.used_frames,
+            seeks_by_decoder_recycled: self.seeks_by_decoder_recycled - o.seeks_by_decoder_recycled,
+            seeks_by_evicted_frame: self.seeks_by_evicted_frame - o.seeks_by_evicted_frame,
+            seeks_by_out_of_order: self.seeks_by_out_of_order - o.seeks_by_out_of_order,
+            seeks_by_cut_in: self.seeks_by_cut_in - o.seeks_by_cut_in,
+            seeks_by_other: self.seeks_by_other - o.seeks_by_other,
+            lock_wait_ns: self.lock_wait_ns - o.lock_wait_ns,
         }
     }
 }
@@ -183,6 +219,10 @@ fn decode_start(s: &dyn VideoSamples, i: usize) -> usize {
 
 struct State {
     decoder: Option<Box<dyn VideoDecoder>>,
+    /// A decoder existed before the current fresh one; committed after seek classification.
+    had_decoder: bool,
+    /// The current decoder has not yet reached seek classification.
+    fresh_decoder: bool,
     /// The decoder only produces intra pictures: frames decode independently and in parallel.
     intra: bool,
     /// Idle decoders for parallel intra decoding.
@@ -194,6 +234,10 @@ struct State {
     out_max: i64,
     /// Decoded frames by presentation pts (bounded).
     frames: BTreeMap<i64, Arc<VideoFrame>>,
+    /// Cached pictures already returned to a caller.
+    used: BTreeSet<i64>,
+    /// Previously decoded pictures evicted since they were last stored.
+    evicted: BTreeSet<i64>,
     /// The cached frames that were decoded in draft mode: served to draft requests only.
     drafts: std::collections::BTreeSet<i64>,
     /// The cached frames still waiting for [`GopCache::finish`]'s crop and rotation: the request
@@ -218,6 +262,7 @@ impl State {
     fn release_decoder(&mut self, pool: &Pool) -> Vec<Box<dyn VideoDecoder>> {
         let mut out = std::mem::take(&mut self.spare);
         if let Some(d) = self.decoder.take() {
+            self.had_decoder = true;
             pool.decoders.fetch_sub(1, Ordering::Relaxed);
             out.push(d);
         }
@@ -231,6 +276,8 @@ impl State {
             let Some((pts, f)) = self.frames.pop_first() else { break };
             self.drafts.remove(&pts);
             self.raw.remove(&pts);
+            self.used.remove(&pts);
+            self.evicted.insert(pts);
             self.bytes = self.bytes.saturating_sub(f.byte_size());
             pool.bytes.fetch_sub(f.byte_size(), Ordering::Relaxed);
             EVICTED.fetch_add(1, Ordering::Relaxed);
@@ -243,6 +290,28 @@ impl State {
         self.frames.get(&pts).filter(|_| draft_ok || !self.drafts.contains(&pts))
     }
 
+    fn count_used(&mut self, pts: i64) {
+        if self.used.insert(pts) {
+            USED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Classify a restart before changing the running decoder's position or random-access key.
+    fn seek_cause(&self, i: usize, key: usize, want_pts: i64) -> SeekCause {
+        if self.fresh_decoder && self.had_decoder {
+            SeekCause::DecoderRecycled
+        } else if self.evicted.contains(&want_pts) {
+            SeekCause::EvictedFrame
+        } else if self.next != usize::MAX && self.next > i {
+            SeekCause::OutOfOrder
+        } else if (self.fresh_decoder && !self.had_decoder) || (self.next != usize::MAX && self.next <= key && key.saturating_sub(self.next) > CONTINUE_THROUGH)
+        {
+            SeekCause::CutIn
+        } else {
+            SeekCause::Other
+        }
+    }
+
     /// The nearest usable frame at or before `pts` (robust to decoder pts quirks).
     fn at_or_before(&self, pts: i64, draft_ok: bool) -> Option<Taken> {
         let (pts, frame) = match self.cached(pts, draft_ok) {
@@ -251,6 +320,15 @@ impl State {
         };
         Some(Taken { pts, frame: frame.clone(), raw: self.raw.contains(&pts) })
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeekCause {
+    DecoderRecycled,
+    EvictedFrame,
+    OutOfOrder,
+    CutIn,
+    Other,
 }
 
 /// A cached frame handed to a request, `raw` while it still waits for [`GopCache::finish`].
@@ -502,6 +580,11 @@ pub fn live_decoders() -> usize {
     Pool::global().decoders.load(Ordering::Relaxed)
 }
 
+/// Highest observed live decoder count, process-wide.
+pub fn live_decoders_peak() -> usize {
+    LIVE_DECODERS_PEAK.load(Ordering::Relaxed)
+}
+
 /// Bytes of decoded frames the caches hold right now, process-wide (`perf.stats`).
 pub fn cached_bytes() -> usize {
     Pool::global().bytes.load(Ordering::Relaxed)
@@ -594,12 +677,16 @@ impl GopCache {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 decoder: None,
+                had_decoder: false,
+                fresh_decoder: false,
                 intra: false,
                 spare: Vec::new(),
                 next: usize::MAX,
                 start: 0,
                 out_max: i64::MIN,
                 frames: BTreeMap::new(),
+                used: BTreeSet::new(),
+                evicted: BTreeSet::new(),
                 drafts: Default::default(),
                 raw: Default::default(),
                 bytes: 0,
@@ -652,6 +739,8 @@ impl GopCache {
     /// phone clip played at 2 fps (#3467). The frame is cached raw instead and [`Self::finished`]
     /// does that work off the lock, for the frames requests actually take.
     fn store(&self, st: &mut State, pts: i64, f: VideoFrame, draft: bool) {
+        st.used.remove(&pts);
+        st.evicted.remove(&pts);
         if self.crop.is_none() && self.rotation == 0 {
             return self.store_finished(st, pts, self.finish(f), draft);
         }
@@ -666,7 +755,9 @@ impl GopCache {
             return t.frame;
         }
         let done = Arc::new(self.finish(VideoFrame::clone(&t.frame)));
+        let wait = Instant::now();
         let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         if st.frames.get(&t.pts).is_some_and(|f| Arc::ptr_eq(f, &t.frame)) {
             let draft = st.drafts.contains(&t.pts);
             self.store_finished(&mut st, t.pts, done.clone(), draft);
@@ -717,6 +808,8 @@ impl GopCache {
             if let Some(v) = st.frames.remove(&victim) {
                 st.drafts.remove(&victim);
                 st.raw.remove(&victim);
+                st.used.remove(&victim);
+                st.evicted.insert(victim);
                 st.bytes -= v.byte_size();
                 EVICTED.fetch_add(1, Ordering::Relaxed);
                 // its planes serve the next decoded pictures instead of going back to the allocator
@@ -802,13 +895,16 @@ impl GopCache {
         // after the guard on every return path: dropping a decoder can block (a hardware session
         // waits for its frames in flight) and must not hold this cache's lock.
         let mut released: Vec<Box<dyn VideoDecoder>> = Vec::new();
+        let wait = Instant::now();
         let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         let _decoding = DecodingGuard::enter(me);
         st.last_used = Instant::now();
         st.pin = want_pts;
         let background = filmcraft_media::cancel::background();
         if let Some(frame) = st.cached(want_pts, draft).cloned() {
             HITS.fetch_add(1, Ordering::Relaxed);
+            st.count_used(want_pts);
             // a monitor asking for a frame of a thumbnail's clip makes its decoder one in use
             st.background &= background;
             return Ok(Taken { pts: want_pts, frame, raw: st.raw.contains(&want_pts) });
@@ -827,8 +923,10 @@ impl GopCache {
             let d = s.make_decoder()?;
             st.intra = d.intra_only();
             st.decoder = Some(d);
+            st.fresh_decoder = true;
             st.next = usize::MAX;
-            self.shared.pool.decoders.fetch_add(1, Ordering::Relaxed);
+            let live = self.shared.pool.decoders.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            LIVE_DECODERS_PEAK.fetch_max(live, Ordering::Relaxed);
         }
         released.extend(self.shared.pool.trim_decoders(&self.shared));
         // Nothing cached: the work ahead (possibly a seek and a GOP of decoding) is only worth it
@@ -841,7 +939,9 @@ impl GopCache {
         }
         // with the lock held: see `isolated`
         let st = &mut *st;
-        isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft))
+        let taken = isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft))?;
+        st.count_used(taken.pts);
+        Ok(taken)
     }
 
     /// Decode (the lock held) until the frame with `want_pts` (sample `i`) is cached; return it.
@@ -860,6 +960,16 @@ impl GopCache {
         let continuing = running && (st.next > key || near) && (i >= st.next || (st.start <= i && want_pts > st.out_max));
         if !continuing {
             SEEKS.fetch_add(1, Ordering::Relaxed);
+            let counter = match st.seek_cause(i, key, want_pts) {
+                SeekCause::DecoderRecycled => &SEEKS_BY_DECODER_RECYCLED,
+                SeekCause::EvictedFrame => &SEEKS_BY_EVICTED_FRAME,
+                SeekCause::OutOfOrder => &SEEKS_BY_OUT_OF_ORDER,
+                SeekCause::CutIn => &SEEKS_BY_CUT_IN,
+                SeekCause::Other => &SEEKS_BY_OTHER,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            st.had_decoder = true;
+            st.fresh_decoder = false;
             // The container's sync flags may be wrong for the codec (an MP4 without `stss` marks
             // every sample): step back to a sample the decoder can start from.
             while key > 0 {
@@ -926,6 +1036,7 @@ impl GopCache {
             .max_by_key(|p| p.pts)
             .map(|p| p.frame)
             .ok_or_else(|| CodecError::Decode("frame not produced".into()))?;
+        USED_FRAMES.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(self.finish(f)))
     }
 
@@ -993,7 +1104,9 @@ impl GopCache {
             timed(|| dec.decode(&data, want_pts))
         });
         let res = res.inspect(|out| count_frames(out));
+        let wait = Instant::now();
         let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         if st.spare.len() < 16 {
             st.spare.push(dec);
         }
@@ -1002,7 +1115,9 @@ impl GopCache {
         for d in res? {
             self.store(&mut st, d.pts, d.frame, d.draft);
         }
-        st.at_or_before(want_pts, true).ok_or_else(|| CodecError::Decode("frame not produced".into()))
+        let taken = st.at_or_before(want_pts, true).ok_or_else(|| CodecError::Decode("frame not produced".into()))?;
+        st.count_used(taken.pts);
+        Ok(taken)
     }
 }
 

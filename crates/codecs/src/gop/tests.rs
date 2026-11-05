@@ -114,6 +114,111 @@ fn samples(n: usize, gop: usize, delay: usize, intra: bool) -> Samples {
     Samples { n, gop, delay, intra, resets: Default::default(), decodes: Default::default() }
 }
 
+#[test]
+fn seek_causes_follow_cache_history_and_precedence() {
+    let s = samples(900, 30, 0, false);
+    let c = GopCache::new(None);
+    let before = gop_stats();
+    assert_eq!(index_of(&c.frame(&s, 100_000).expect("first request")), 100);
+    assert!(gop_stats().seeks_by_cut_in - before.seeks_by_cut_in >= 1);
+    let cause = |i| c.shared.state.lock().unwrap().seek_cause(i, decode_start(&s, i), s.pts(i));
+    assert_eq!(cause(20), SeekCause::OutOfOrder);
+    assert_eq!(index_of(&c.frame(&s, 20_000).expect("backwards")), 20);
+    assert_eq!(cause(300), SeekCause::CutIn);
+    assert_eq!(index_of(&c.frame(&s, 300_000).expect("far forward")), 300);
+    {
+        let mut st = c.shared.state.lock().unwrap();
+        st.release_frames(&c.shared.pool, || true);
+        assert!(!st.used.contains(&300_000));
+        assert!(st.evicted.contains(&300_000));
+    }
+    // Eviction takes precedence over the running decoder already being past this sample.
+    assert_eq!(cause(300), SeekCause::EvictedFrame);
+    assert_eq!(index_of(&c.frame(&s, 300_000).expect("evicted")), 300);
+    {
+        let mut st = c.shared.state.lock().unwrap();
+        assert!(!st.evicted.contains(&300_000));
+        let released = st.release_decoder(&c.shared.pool);
+        drop(st);
+        drop(released);
+    }
+    assert_eq!(index_of(&c.frame(&s, 600_000).expect("recycled decoder")), 600);
+    assert_eq!(s.resets.load(Ordering::Relaxed), 5);
+    let delta = gop_stats() - before;
+    assert!(delta.seeks >= 5 && delta.seeks_by_cut_in >= 2);
+    assert!(delta.seeks_by_out_of_order >= 1 && delta.seeks_by_evicted_frame >= 1 && delta.seeks_by_decoder_recycled >= 1);
+    // Exercise the mutually overlapping causes without depending on global counters.
+    let mut st = c.shared.state.lock().unwrap();
+    st.fresh_decoder = true;
+    st.evicted.insert(20_000);
+    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::DecoderRecycled);
+    st.had_decoder = false;
+    st.next = usize::MAX;
+    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::EvictedFrame);
+    st.evicted.clear();
+    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::CutIn);
+    st.fresh_decoder = false;
+    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::Other);
+}
+
+#[test]
+fn used_frames_count_each_decoded_picture_once() {
+    for intra in [false, true] {
+        let s = samples(60, 30, 0, intra);
+        let c = GopCache::new(None).with_rotation(1);
+        let before = gop_stats().used_frames;
+        let first = c.frame(&s, 5_000).expect("first");
+        assert!(gop_stats().used_frames - before >= 1);
+        assert!(Arc::ptr_eq(&first, &c.frame(&s, 5_000).expect("cached")));
+        assert_eq!(c.shared.state.lock().unwrap().used, BTreeSet::from([5_000]));
+        let decoded = s.decodes.load(Ordering::Relaxed);
+        {
+            let mut st = c.shared.state.lock().unwrap();
+            // Newly decoded output at the same pts is a different picture, even without eviction.
+            c.store(&mut st, 5_000, picture((5_000, false)).frame, false);
+            assert!(!st.used.contains(&5_000));
+        }
+        c.frame(&s, 5_000).expect("replacement");
+        assert_eq!(c.shared.state.lock().unwrap().used, BTreeSet::from([5_000]));
+        assert_eq!(s.decodes.load(Ordering::Relaxed), decoded, "the repeated request is cached");
+        assert!(gop_stats().used_frames - before >= 2);
+    }
+}
+
+#[test]
+fn gop_counters_only_grow() {
+    let before = gop_stats();
+    let peak = live_decoders_peak();
+    let s = samples(300, 30, 0, false);
+    let c = GopCache::new(None).with_rotation(1);
+    for pts in [100_000, 20_000, 20_000] {
+        c.frame(&s, pts).expect("frame");
+    }
+    let after = gop_stats();
+    macro_rules! growing {
+        ($($field:ident),+ $(,)?) => { $(assert!(after.$field >= before.$field, stringify!($field));)+ };
+    }
+    growing!(
+        hits,
+        misses,
+        seeks,
+        decoded,
+        evicted,
+        decode_ns,
+        skipped,
+        draft,
+        frames,
+        used_frames,
+        seeks_by_decoder_recycled,
+        seeks_by_evicted_frame,
+        seeks_by_out_of_order,
+        seeks_by_cut_in,
+        seeks_by_other,
+        lock_wait_ns,
+    );
+    assert!(live_decoders_peak() >= peak.max(c.shared.pool.decoders.load(Ordering::Relaxed)));
+}
+
 fn index_of(f: &VideoFrame) -> usize {
     match &f.data {
         filmcraft_frame::PixelData::Rgba8(d) => d[0] as usize | (d[1] as usize) << 8,
