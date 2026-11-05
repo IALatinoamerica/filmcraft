@@ -453,9 +453,8 @@ fn gpu_hook_scenarios() {
     // at most one panic per pooled renderer (4): none is used again after it panicked
     assert!(PANICS.load(std::sync::atomic::Ordering::SeqCst) <= 4, "renderer reused after a panic: {}", PANICS.load(std::sync::atomic::Ordering::SeqCst));
 
-    // 5. A frame the planner hands back as one CPU image (an adjustment layer over the clip from
-    //    frame 12) is rendered by the CPU without taking a pooled renderer: it counts as a
-    //    fallback, and the renderer's picture reaches only the frames before it.
+    // 5. An eligible adjustment layer over the clip from frame 12 is planned for the GPU:
+    //    the renderer's picture reaches every frame, including the adjustment, without fallbacks.
     crate::reset_frame_renderers_for_tests();
     crate::register_frame_renderer(|| Some(Box::new(FakeRenderer) as Box<dyn FrameRenderer>));
     let (p, seq, m) = project();
@@ -479,9 +478,9 @@ fn gpu_hook_scenarios() {
     let frame = |name: &str, f: &str| std::fs::read(tmp(&format!("{name}{f}.png"))).unwrap();
     assert_ne!(frame("adj-off", "011"), frame("adj-auto", "011"), "a layered frame goes to the renderer");
     for f in ["012", "023"] {
-        assert_eq!(frame("adj-off", f), frame("adj-auto", f), "frame {f}: an adjustment layer frame is the CPU's");
+        assert_ne!(frame("adj-off", f), frame("adj-auto", f), "frame {f}: an eligible adjustment layer frame goes to the renderer");
     }
-    assert_eq!((gpu_render_stats().frames, gpu_render_stats().fallbacks), (12, 12), "{:?}", gpu_render_stats());
+    assert_eq!((gpu_render_stats().frames, gpu_render_stats().fallbacks), (24, 0), "{:?}", gpu_render_stats());
     crate::reset_frame_renderers_for_tests();
 }
 
