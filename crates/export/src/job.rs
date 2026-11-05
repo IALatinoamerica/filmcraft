@@ -136,7 +136,7 @@ fn render_batch(
                     pending.store(true, Ordering::Relaxed);
                 }
                 if let Some(prepare) = prepare {
-                    let _convert = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+                    let _convert = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
                     let index = u64::try_from(fi - f0).unwrap_or(u64::MAX);
                     prepare(&EncoderFrame { width: pipe.w, height: pipe.h, rgba: &frame.0, hdr: pipe.hdr_out.then_some(frame.1.as_slice()), index });
                 }

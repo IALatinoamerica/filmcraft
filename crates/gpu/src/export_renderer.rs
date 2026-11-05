@@ -19,12 +19,13 @@ use filmcraft_time::Tick;
 
 /// Where export rendering spends its time (process-wide totals, for the bench).
 pub mod timing {
+    use filmcraft_frame::gpu_stats;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    static SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
-    static MAP_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    static CONVERT_NS: AtomicU64 = AtomicU64::new(0);
+    static SUBMIT_BASELINE_NS: AtomicU64 = AtomicU64::new(0);
+    static MAP_WAIT_BASELINE_NS: AtomicU64 = AtomicU64::new(0);
+    static CONVERT_BASELINE_NS: AtomicU64 = AtomicU64::new(0);
     static FRAMES: AtomicU64 = AtomicU64::new(0);
 
     /// Totals since the last [`reset`].
@@ -40,20 +41,16 @@ pub mod timing {
         pub frames: u64,
     }
 
-    fn add(counter: &AtomicU64, d: Duration) {
-        counter.fetch_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
-    }
-
     pub(crate) fn add_submit(d: Duration) {
-        add(&SUBMIT_NS, d);
+        gpu_stats::add_submit(d);
     }
 
     pub(crate) fn add_map_wait(d: Duration) {
-        add(&MAP_WAIT_NS, d);
+        gpu_stats::add_map_wait(d);
     }
 
     pub(crate) fn add_convert(d: Duration) {
-        add(&CONVERT_NS, d);
+        gpu_stats::add_readback_convert(d);
     }
 
     pub(crate) fn add_frame() {
@@ -61,14 +58,22 @@ pub mod timing {
     }
 
     pub fn get() -> GpuTimings {
-        let d = |c: &AtomicU64| Duration::from_nanos(c.load(Ordering::Relaxed));
-        GpuTimings { submit: d(&SUBMIT_NS), map_wait: d(&MAP_WAIT_NS), convert: d(&CONVERT_NS), frames: FRAMES.load(Ordering::Relaxed) }
+        let stats = gpu_stats::snapshot();
+        let d = |ns: u64, baseline: &AtomicU64| Duration::from_nanos(ns.saturating_sub(baseline.load(Ordering::Relaxed)));
+        GpuTimings {
+            submit: d(stats.submit_ns, &SUBMIT_BASELINE_NS),
+            map_wait: d(stats.map_wait_ns, &MAP_WAIT_BASELINE_NS),
+            convert: d(stats.readback_convert_ns, &CONVERT_BASELINE_NS),
+            frames: FRAMES.load(Ordering::Relaxed),
+        }
     }
 
     pub fn reset() {
-        for c in [&SUBMIT_NS, &MAP_WAIT_NS, &CONVERT_NS, &FRAMES] {
-            c.store(0, Ordering::Relaxed);
-        }
+        let stats = gpu_stats::snapshot();
+        SUBMIT_BASELINE_NS.store(stats.submit_ns, Ordering::Relaxed);
+        MAP_WAIT_BASELINE_NS.store(stats.map_wait_ns, Ordering::Relaxed);
+        CONVERT_BASELINE_NS.store(stats.readback_convert_ns, Ordering::Relaxed);
+        FRAMES.store(0, Ordering::Relaxed);
     }
 }
 
@@ -149,17 +154,23 @@ impl ExportRenderer {
         let plan = plan_frame(project, seq, t, opts, sources);
         match &plan {
             // Already the CPU image: return it unchanged instead of rendering it twice.
-            FramePlan::Image(img) => Some(img.clone()),
+            FramePlan::Image(img) => {
+                filmcraft_frame::gpu_stats::note_cpu_whole_frame(filmcraft_frame::gpu_stats::CpuWholeFrame::PlanExhausted);
+                Some(img.clone())
+            }
             FramePlan::Layers { .. } | FramePlan::Composite { .. } => {
                 if device_failed() {
                     return None;
                 }
+                let started = std::time::Instant::now();
                 let prep = prepare(&plan);
+                filmcraft_frame::gpu_stats::add_upload_prep(started.elapsed());
                 let (w, h, px) = self.compositor.render_export_prepared(&plan, Some(&prep))?;
                 // an error reported while this frame was drawn leaves its pixels untrusted
                 if device_failed() {
                     return None;
                 }
+                filmcraft_frame::render_timing::mark_gpu_frame();
                 timing::add_frame();
                 Some(Image { w: w as usize, h: h as usize, px })
             }

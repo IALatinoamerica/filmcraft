@@ -68,7 +68,7 @@ pub fn gpu_input(project: &Project, item: ItemId, pipe: &ColorPipeline, cs: Colo
 
 /// Decode a frame of `item` (box-decimated by `n`) into the working space of `pipe`.
 pub fn decode(project: &Project, item: ItemId, frame: &VideoFrame, n: usize, pipe: &ColorPipeline) -> Image {
-    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::InputConvert);
     let cs = source_space(project, item, frame);
     if !needs_management(pipe, cs, frame) {
         let (w, h, px) = frame.to_linear_f32_decimated(n);
@@ -92,7 +92,7 @@ pub fn decode(project: &Project, item: ItemId, frame: &VideoFrame, n: usize, pip
 
 /// Working space → monitor (SDR BT.709) for a non-plain pipeline; no-op otherwise.
 pub fn to_display(img: &mut Image, pipe: &ColorPipeline) {
-    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
     if display_is_identity(pipe) {
         return;
     }

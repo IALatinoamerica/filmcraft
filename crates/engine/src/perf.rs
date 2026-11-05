@@ -71,13 +71,34 @@ pub fn decode_json() -> Value {
 /// the export's wall time; `waitMs` is the encoding side's idle wait for the render.
 pub fn export_json() -> Value {
     let hw = filmcraft_export::hw_encode_stats();
+    let gpu = filmcraft_export::gpu_render_stats();
+    let gpu_times = filmcraft_frame::gpu_stats::snapshot();
     let stages: serde_json::Map<String, Value> =
         filmcraft_export::stage_times().into_iter().map(|(s, ns)| (format!("{}Ms", s.name()), json!(ns as f64 / 1e6))).collect();
     let render_tasks: serde_json::Map<String, Value> =
         filmcraft_frame::render_timing::times().into_iter().map(|(name, ns)| (name.to_owned(), json!(ns as f64 / 1e6))).collect();
     let outside: serde_json::Map<String, Value> =
         filmcraft_export::outside_times().into_iter().map(|(name, ns)| (name.to_owned(), json!(ns as f64 / 1e6))).collect();
-    json!({"hardware": {"frames": hw.frames, "sessions": hw.sessions, "declined": hw.declined}, "stages": stages, "renderTasks": render_tasks, "outside": outside})
+    json!({
+        "hardware": {"frames": hw.frames, "sessions": hw.sessions, "declined": hw.declined},
+        "gpu": {
+            "frames": gpu.frames,
+            "fallbacks": gpu.fallbacks,
+            "cpuWholeFrames": {
+                "adjustment": gpu_times.adjustment,
+                "transition": gpu_times.transition,
+                "hdr": gpu_times.hdr,
+                "planExhausted": gpu_times.plan_exhausted,
+            },
+            "gpuSubmitMs": gpu_times.submit_ns as f64 / 1e6,
+            "gpuReadbackMs": gpu_times.map_wait_ns as f64 / 1e6,
+            "gpuReadbackConvertMs": gpu_times.readback_convert_ns as f64 / 1e6,
+            "gpuUploadPrepMs": gpu_times.upload_prep_ns as f64 / 1e6,
+        },
+        "stages": stages,
+        "renderTasks": render_tasks,
+        "outside": outside,
+    })
 }
 
 /// The engine's `perf.stats`.
@@ -148,11 +169,52 @@ mod tests {
         for (name, _) in filmcraft_frame::render_timing::times() {
             assert!(v["export"]["renderTasks"][name].is_number(), "renderTasks.{name}");
         }
+        for name in ["gpuInputConvertMs", "gpuOutputConvertMs", "cpuInputConvertMs", "cpuOutputConvertMs"] {
+            assert!(v["export"]["renderTasks"][name].is_number(), "renderTasks.{name}");
+        }
         for (name, _) in filmcraft_export::outside_times() {
             assert!(v["export"]["outside"][name].is_number(), "outside.{name}");
         }
         assert!(v["media"]["openSources"].is_number());
         assert_eq!(v["jobs"]["running"], json!(0));
         assert_eq!(s.history.undo.len(), undo, "a query adds no undo step");
+    }
+
+    #[test]
+    fn perf_stats_gpu_counters_are_cumulative() {
+        use filmcraft_frame::gpu_stats::{self, CpuWholeFrame};
+        use std::time::Duration;
+
+        let mut s = Session::default();
+        let before = s.execute("perf.stats", json!({})).unwrap();
+        let keys = ["frames", "fallbacks", "gpuSubmitMs", "gpuReadbackMs", "gpuReadbackConvertMs", "gpuUploadPrepMs"];
+        let reasons = ["adjustment", "transition", "hdr", "planExhausted"];
+        assert!(before["export"]["gpu"]["cpuWholeFrames"].is_object());
+        for key in keys {
+            assert!(before["export"]["gpu"][key].is_number(), "export.gpu.{key}");
+        }
+        for reason in reasons {
+            assert!(before["export"]["gpu"]["cpuWholeFrames"][reason].is_number(), "export.gpu.cpuWholeFrames.{reason}");
+        }
+
+        let elapsed = Duration::from_millis(1);
+        gpu_stats::add_submit(elapsed);
+        gpu_stats::add_map_wait(elapsed);
+        gpu_stats::add_readback_convert(elapsed);
+        gpu_stats::add_upload_prep(elapsed);
+        for reason in [CpuWholeFrame::Adjustment, CpuWholeFrame::Transition, CpuWholeFrame::Hdr, CpuWholeFrame::PlanExhausted] {
+            gpu_stats::note_cpu_whole_frame(reason);
+        }
+
+        let after = s.execute("perf.stats", json!({})).unwrap();
+        for key in keys {
+            assert!(after["export"]["gpu"][key].as_f64().unwrap() >= before["export"]["gpu"][key].as_f64().unwrap(), "export.gpu.{key}");
+        }
+        for reason in reasons {
+            assert!(
+                after["export"]["gpu"]["cpuWholeFrames"][reason].as_f64().unwrap() >= before["export"]["gpu"]["cpuWholeFrames"][reason].as_f64().unwrap(),
+                "export.gpu.cpuWholeFrames.{reason}"
+            );
+        }
     }
 }

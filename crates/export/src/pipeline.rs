@@ -251,7 +251,18 @@ impl Pipeline {
         // planner hands back as one CPU image anyway (an adjustment layer, a complex transition,
         // HDR) does not take a pooled renderer: it would render on the CPU inside the pool, as
         // many frames at a time as there are renderers instead of one per export thread.
-        let pool = self.renderer.as_ref().filter(|_| !filmcraft_render::plan::is_cpu_frame(&self.project, self.seq, t));
+        let pool = self.renderer.as_ref().filter(|_| {
+            if let Some(reason) = filmcraft_render::plan::cpu_frame_reason(&self.project, self.seq, t) {
+                use filmcraft_frame::gpu_stats::{CpuWholeFrame, note_cpu_whole_frame};
+                use filmcraft_render::plan::CpuFrameReason;
+                note_cpu_whole_frame(match reason {
+                    CpuFrameReason::Adjustment => CpuWholeFrame::Adjustment,
+                    CpuFrameReason::Transition => CpuWholeFrame::Transition,
+                    CpuFrameReason::Hdr => CpuWholeFrame::Hdr,
+                });
+            }
+            !filmcraft_render::plan::is_cpu_frame(&self.project, self.seq, t)
+        });
         let gpu = match pool {
             Some(pool) => {
                 let asked = web_time::Instant::now();
@@ -279,7 +290,7 @@ impl Pipeline {
         self.overlays(&mut img, t);
         let lim = &self.effects.video_limiter;
         if let Some(tf) = self.out_tf.as_ref().filter(|_| self.hdr_out) {
-            let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+            let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
             let mut out = vec![0f32; img.w * img.h * 3];
             out.par_chunks_mut(img.w * 3).zip(img.px.par_chunks(img.w * 4)).for_each(|(o, s)| {
                 for (o, p) in o.as_chunks_mut::<3>().0.iter_mut().zip(s.as_chunks::<4>().0) {

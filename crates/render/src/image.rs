@@ -216,7 +216,7 @@ impl Image {
 
     /// Convert to straight sRGB RGBA8.
     pub fn to_rgba8(&self) -> Vec<u8> {
-        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
         if self.w == 0 || self.h == 0 {
             return Vec::new();
         }
@@ -227,7 +227,7 @@ impl Image {
 
     /// Opaque version over black (for monitors).
     pub fn over_black_rgba8(&self) -> Vec<u8> {
-        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
         if self.w == 0 || self.h == 0 {
             return Vec::new();
         }
@@ -240,7 +240,7 @@ impl Image {
     /// the same (the sRGB of the premultiplied linear color), so the picture still shows over
     /// black, and the alpha says where it is transparent.
     pub fn over_black_with_alpha_rgba8(&self) -> Vec<u8> {
-        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::OutputConvert);
         if self.w == 0 || self.h == 0 {
             return Vec::new();
         }

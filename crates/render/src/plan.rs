@@ -274,7 +274,24 @@ pub fn source_frame_requests(
 /// GPU renderer gains nothing on such a frame, so a caller with only a few of them (the export's
 /// pool) can render it on the CPU without taking one.
 pub fn is_cpu_frame(project: &Project, seq_id: ItemId, t: Tick) -> bool {
-    project.sequence(seq_id).is_none_or(|seq| whole_frame_on_cpu(project, seq, t))
+    project.sequence(seq_id).is_none() || cpu_frame_reason(project, seq_id, t).is_some()
+}
+
+/// Why the frame must be rendered entirely on the CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuFrameReason {
+    Adjustment,
+    Transition,
+    Hdr,
+}
+
+/// The first whole-frame CPU reason at `t`, or none for a missing sequence.
+pub fn cpu_frame_reason(project: &Project, seq_id: ItemId, t: Tick) -> Option<CpuFrameReason> {
+    let seq = project.sequence(seq_id)?;
+    if !seq.settings.color.is_plain() {
+        return Some(CpuFrameReason::Hdr);
+    }
+    layered_cpu_reason(project, seq, t)
 }
 
 /// The frames [`plan_frame`] does not plan: an HDR / wide-gamut sequence composites and converts
@@ -288,6 +305,10 @@ fn whole_frame_on_cpu(project: &Project, seq: &Sequence, t: Tick) -> bool {
 /// transition the compositor cannot mix itself is showing (a transition into or out of an
 /// adjustment layer counts, also on the side of the cut where the other clip is).
 pub(crate) fn layered_at(project: &Project, seq: &Sequence, t: Tick) -> bool {
+    layered_cpu_reason(project, seq, t).is_none()
+}
+
+fn layered_cpu_reason(project: &Project, seq: &Sequence, t: Tick) -> Option<CpuFrameReason> {
     let adjustment = |it: &TrackItem| project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::AdjustmentLayer { .. }));
     for tr in &seq.video_tracks {
         if !tr.enabled {
@@ -295,19 +316,19 @@ pub(crate) fn layered_at(project: &Project, seq: &Sequence, t: Tick) -> bool {
         }
         if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t)) {
             if !simple_transition(&trn.effect.effect) && trn.effect.effect != "push" {
-                return false;
+                return Some(CpuFrameReason::Transition);
             }
             if [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(adjustment) {
-                return false;
+                return Some(CpuFrameReason::Adjustment);
             }
         }
         if let Some(it) = tr.item_at(t)
             && adjustment(it)
         {
-            return false;
+            return Some(CpuFrameReason::Adjustment);
         }
     }
-    true
+    None
 }
 
 /// Push the layers of every video track of `seq` at `t`, bottom track first (`seq` must be
