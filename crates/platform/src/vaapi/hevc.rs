@@ -18,11 +18,11 @@ use filmcraft_hevc::dpb::{Dpb, Marking, Output, OutputMeta, PocState, Ref, RefPi
 use filmcraft_hevc::params::{Layout, Pps, ScalingList, Sps};
 use filmcraft_hevc::slice::{NalHeader, SliceHeader, SliceType, nal_type};
 
-use super::Accel;
 use super::ffi::{
     self, VAIQMatrixBufferHEVC, VAPictureHEVC, VAPictureParameterBufferHEVC, VASliceParameterBufferHEVC, hevc_pic_bits, hevc_slice_bits,
     hevc_slice_parsing_bits,
 };
+use super::{Accel, DEFAULT_READBACK_DEPTH, PendingReadbacks};
 
 /// A picture in the DPB: its surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,7 @@ pub struct Front<A: Accel> {
     accel: A,
     length_size: usize,
     output_floor: Option<i64>,
+    readbacks: PendingReadbacks<Arc<OutputMeta>>,
     /// Coded size (luma samples) and bit depth the surfaces were made for.
     size: (u32, u32),
     bits: u32,
@@ -85,10 +86,17 @@ impl<A: Accel> Front<A> {
     /// carried `parameter_sets` (VPS / SPS / PPS NAL units), decoding into `accel`'s surfaces of
     /// `size` luma samples and `bits` bits.
     pub fn new(accel: A, length_size: usize, size: (u32, u32), bits: u32, parameter_sets: &[Vec<u8>]) -> Result<Self> {
+        Self::new_with_depth(accel, length_size, size, bits, parameter_sets, DEFAULT_READBACK_DEPTH)
+    }
+
+    /// Construct with an explicit readback depth, without reading process environment.
+    pub fn new_with_depth(accel: A, length_size: usize, size: (u32, u32), bits: u32, parameter_sets: &[Vec<u8>], depth: usize) -> Result<Self> {
+        let readbacks = PendingReadbacks::new(accel.surfaces().len(), depth);
         let mut f = Self {
             accel,
             length_size,
             output_floor: None,
+            readbacks,
             size,
             bits,
             spss: vec![None; 16],
@@ -116,7 +124,7 @@ impl<A: Accel> Front<A> {
         self.output_floor = pts;
     }
 
-    /// Decode one access unit; pictures that left the DPB come back in output order.
+    /// Decode one access unit; return DPB outputs in order after the readback delay.
     pub fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
         let nals = length_prefixed_nals(sample, self.length_size).map_err(decode_err)?;
         let mut frames = Vec::new();
@@ -127,7 +135,7 @@ impl<A: Accel> Front<A> {
         Ok(frames)
     }
 
-    /// Output every picture still held for reordering; what follows starts like a new stream
+    /// Drain reordering and pending readbacks; what follows starts like a new stream
     /// (a CRA's RASL pictures are left out), as in software.
     pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
@@ -135,12 +143,14 @@ impl<A: Accel> Front<A> {
         let mut outs = Vec::new();
         self.dpb.flush(&mut outs);
         self.read_out(outs, &mut frames)?;
+        self.readbacks.read(&mut self.accel, &mut frames, true, |meta| meta.pts)?;
         self.first_picture = true;
         Ok(frames)
     }
 
     /// Forget every picture (after a seek).
     pub fn reset(&mut self) {
+        self.readbacks.reset();
         self.dpb = Dpb::default();
         self.poc_state = PocState::default();
         self.active_sps = None;
@@ -150,16 +160,15 @@ impl<A: Accel> Front<A> {
         self.after_eos = false;
     }
 
-    /// Read back the pictures the DPB output, right away: a surface leaving the DPB is reused.
+    /// Skip unwanted outputs before taking a readback hold on their surfaces.
     fn read_out(&mut self, outs: Vec<Output<Surface>>, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         for o in outs {
             if self.output_floor.is_some_and(|floor| o.meta.pts < floor) {
                 continue;
             }
-            let frame = self.accel.read(o.frame.index).map_err(decode_err)?;
-            frames.push(DecodedFrame { pts: o.meta.pts, frame, draft: false });
+            self.readbacks.enqueue(o.frame.index, o.meta)?;
         }
-        Ok(())
+        self.readbacks.read(&mut self.accel, frames, false, |meta| meta.pts)
     }
 
     fn handle_nal(&mut self, nal: &[u8], pts: i64, frames: &mut Vec<DecodedFrame>) -> Result<()> {
@@ -279,7 +288,9 @@ impl<A: Accel> Front<A> {
         }
         self.read_out(outs, frames)?;
         let surfaces = self.accel.surfaces();
-        let target = (0..surfaces.len()).find(|&i| !self.dpb.entries.iter().any(|e| e.frame.index == i)).ok_or_else(|| decode_err("no free surface"))?;
+        let target = (0..surfaces.len())
+            .find(|&i| !self.readbacks.is_pending(i) && !self.dpb.entries.iter().any(|e| e.frame.index == i))
+            .ok_or_else(|| decode_err("no free surface"))?;
         let target_id = surfaces.get(target).copied().ok_or_else(|| decode_err("surface out of range"))?;
         let mut pic = picture_params(sps, pps, sh)?;
         pic.CurrPic = VAPictureHEVC { picture_id: target_id, pic_order_cnt: poc, flags: 0, va_reserved: [0; ffi::VA_PADDING_LOW] };

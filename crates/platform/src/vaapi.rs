@@ -25,7 +25,63 @@ mod tests;
 #[cfg(target_os = "linux")]
 pub use linux::VaDecoder;
 
+use std::collections::VecDeque;
+
+use filmcraft_codecs::{CodecError, DecodedFrame, Result};
 use filmcraft_frame::VideoFrame;
+
+const DEFAULT_READBACK_DEPTH: usize = 3;
+
+fn readback_depth(value: Option<&str>) -> usize {
+    value.and_then(|value| value.parse().ok()).unwrap_or(DEFAULT_READBACK_DEPTH)
+}
+
+fn surface_count(dpb: usize, depth: usize) -> usize {
+    dpb.saturating_add(2).saturating_add(depth).min(24)
+}
+
+/// DPB outputs keep their surfaces until the FIFO's readback succeeds (or a reset).
+struct PendingReadbacks<M> {
+    queue: VecDeque<(usize, M)>,
+    pending_readback: Vec<bool>,
+    depth: usize,
+}
+
+impl<M> PendingReadbacks<M> {
+    fn new(surfaces: usize, depth: usize) -> Self {
+        Self { queue: VecDeque::new(), pending_readback: vec![false; surfaces], depth }
+    }
+
+    fn enqueue(&mut self, surface: usize, meta: M) -> Result<()> {
+        let held = self.pending_readback.get_mut(surface).ok_or_else(|| CodecError::Decode("surface out of range".into()))?;
+        *held = true;
+        self.queue.push_back((surface, meta));
+        Ok(())
+    }
+
+    fn is_pending(&self, surface: usize) -> bool {
+        self.pending_readback.get(surface).copied().unwrap_or(false)
+    }
+
+    fn read(&mut self, accel: &mut impl Accel, frames: &mut Vec<DecodedFrame>, flush: bool, pts: impl Fn(&M) -> i64) -> Result<()> {
+        let keep = if flush { 0 } else { self.depth };
+        while self.queue.len() > keep {
+            let Some((surface, meta)) = self.queue.front() else { break };
+            let frame = accel.read(*surface).map_err(CodecError::Decode)?;
+            frames.push(DecodedFrame { pts: pts(meta), frame, draft: false });
+            if let Some(held) = self.pending_readback.get_mut(*surface) {
+                *held = false;
+            }
+            self.queue.pop_front();
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.queue.clear();
+        self.pending_readback.fill(false);
+    }
+}
 
 /// The hardware a front end ([`h264::Front`], [`hevc::Front`]) drives: a fixed set of surfaces,
 /// picture decoding into one of them, and reading one back or filling it.
@@ -65,7 +121,7 @@ mod linux {
     use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 
     use super::va::Session;
-    use super::{ffi, h264, hevc};
+    use super::{ffi, h264, hevc, readback_depth, surface_count};
     use crate::biplanar::Geometry;
 
     /// The VA-API profiles that decode an H.264 stream of `profile_idc`, best fit first (a Main or
@@ -113,6 +169,12 @@ mod linux {
     impl VaDecoder {
         /// A decoder for the stream `info` describes, or why VA-API does not take it on this system.
         pub fn new(info: NalStreamInfo) -> std::result::Result<Self, String> {
+            let depth = readback_depth(std::env::var("FILMCRAFT_VAAPI_DEPTH").ok().as_deref());
+            Self::new_with_depth(info, depth)
+        }
+
+        /// Explicit readback depth, also used by tests without changing process environment.
+        pub fn new_with_depth(info: NalStreamInfo, depth: usize) -> std::result::Result<Self, String> {
             let bits = info.bit_depth_luma;
             if info.chroma_format_idc != 1 || info.bit_depth_chroma != bits || info.interlaced {
                 return Err(format!(
@@ -133,11 +195,17 @@ mod linux {
                     let sps = filmcraft_h264::params::Sps::parse(&rbsp).map_err(|e| e.to_string())?;
                     sps.check_supported().map_err(|e| e.to_string())?;
                     let mbs = (sps.pic_width_in_mbs, sps.frame_height_in_mbs());
-                    // the DPB, the picture being decoded, and one spare
-                    let count = sps.max_dpb_frames().saturating_add(2).min(18);
+                    // The DPB, current picture, spare, and queued readbacks.
+                    let count = surface_count(sps.max_dpb_frames(), depth);
                     let session = Session::new(profiles, (sps.width(), sps.height()), count, geometry)?;
                     let vendor = session.vendor().to_string();
-                    (Front::H264(Box::new(h264::Front::new(session, info.length_size, mbs, &info.parameter_sets).map_err(|e| e.to_string())?)), "H.264", vendor)
+                    (
+                        Front::H264(Box::new(
+                            h264::Front::new_with_depth(session, info.length_size, mbs, &info.parameter_sets, depth).map_err(|e| e.to_string())?,
+                        )),
+                        "H.264",
+                        vendor,
+                    )
                 }
                 NalCodec::Hevc => {
                     let profiles =
@@ -148,12 +216,14 @@ mod linux {
                     if sps.range_extension {
                         return Err("HEVC range extensions are not taken".into());
                     }
-                    let count = (sps.max_dec_pic_buffering as usize).saturating_add(2).min(18);
+                    let count = surface_count(sps.max_dec_pic_buffering as usize, depth);
                     let size = (sps.width, sps.height);
                     let session = Session::new(profiles, size, count, geometry)?;
                     let vendor = session.vendor().to_string();
                     (
-                        Front::Hevc(Box::new(hevc::Front::new(session, info.length_size, size, bits, &info.parameter_sets).map_err(|e| e.to_string())?)),
+                        Front::Hevc(Box::new(
+                            hevc::Front::new_with_depth(session, info.length_size, size, bits, &info.parameter_sets, depth).map_err(|e| e.to_string())?,
+                        )),
                         "HEVC",
                         vendor,
                     )

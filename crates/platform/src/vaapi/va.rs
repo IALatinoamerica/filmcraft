@@ -249,7 +249,9 @@ impl Drop for Display {
     }
 }
 
-/// One stream's decoder: a VLD configuration of a profile, its surfaces and context, and the image
+const IMAGE_RING_SIZE: usize = 2;
+
+/// One stream's decoder: a VLD configuration of a profile, its surfaces and context, and the images
 /// pictures are read back through.
 pub struct Session {
     /// The shared display (see [`SHARED`]), or the one that replaced it.
@@ -257,7 +259,8 @@ pub struct Session {
     config: ffi::VAConfigID,
     context: ffi::VAContextID,
     surfaces: Vec<VASurfaceID>,
-    image: Option<VAImage>,
+    images: [Option<VAImage>; IMAGE_RING_SIZE],
+    next_image: usize,
     /// None until the first derive attempt; only derive success and format decide support.
     derive_supported: Option<bool>,
     readback: ReadbackBuffer,
@@ -333,7 +336,8 @@ impl Session {
             config,
             context: ffi::VA_INVALID_ID,
             surfaces: Vec::new(),
-            image: None,
+            images: [None; IMAGE_RING_SIZE],
+            next_image: 0,
             derive_supported: None,
             readback: ReadbackBuffer::default(),
             size,
@@ -425,7 +429,9 @@ impl Session {
     }
 
     fn image(&mut self) -> Result<VAImage, String> {
-        if let Some(image) = self.image {
+        let slot = self.images.get_mut(self.next_image).ok_or("image ring slot out of range")?;
+        if let Some(image) = *slot {
+            self.next_image = (self.next_image + 1) % IMAGE_RING_SIZE;
             return Ok(image);
         }
         let (_, fourcc, bits_per_pixel) = formats(self.geometry.bits)?;
@@ -435,11 +441,13 @@ impl Session {
         // SAFETY: `format` and `image` are live; the driver fills `image` in.
         let st = unsafe { (self.display.api.create_image)(self.display.dpy, &mut format, w, h, &mut image) };
         self.display.check(st, "vaCreateImage")?;
-        self.image = Some(image);
+        *slot = Some(image);
+        self.next_image = (self.next_image + 1) % IMAGE_RING_SIZE;
         Ok(image)
     }
 
-    /// The picture in surface `index`, copied into the session's image once decoded.
+    /// The picture in surface `index`, copied into the next ring image once decoded.
+    /// Its contents remain valid until IMAGE_RING_SIZE more images are requested.
     fn get_image(&mut self, index: usize) -> Result<VAImage, String> {
         let surface = *self.surfaces.get(index).ok_or("surface out of range")?;
         let image = self.image()?;
@@ -684,7 +692,7 @@ impl Drop for Session {
         // session only; the display itself is terminated when its last user lets it go (the
         // shared one never is).
         unsafe {
-            if let Some(image) = self.image.take() {
+            for image in self.images.iter_mut().filter_map(Option::take) {
                 (api.destroy_image)(dpy, image.image_id);
             }
             if self.context != ffi::VA_INVALID_ID {
@@ -774,6 +782,90 @@ mod tests {
             PixelData::Yuv16 { planes, .. } => planes.each_ref().map(|p| p.to_vec()),
             _ => panic!("expected planar YUV"),
         }
+    }
+
+    fn write_test_surface(session: &mut Session, index: usize, value: u16) {
+        // Keep the second slot unallocated until the ring is exercised below.
+        session.next_image = 0;
+        let image = session.image().unwrap();
+        let (api, dpy) = (session.display.api, session.display.dpy);
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: this session owns the image buffer; ptr is a live output.
+        let st = unsafe { (api.map_buffer)(dpy, image.buf, &mut ptr) };
+        session.display.check(st, "vaMapBuffer").unwrap();
+        assert!(!ptr.is_null());
+        {
+            // SAFETY: the mapped buffer has data_size writable bytes, used only before unmapping.
+            let data = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), readback_len(image.data_size).unwrap()) };
+            if session.geometry.bits == 8 {
+                data.fill(value as u8);
+            } else {
+                for sample in data.as_chunks_mut::<2>().0 {
+                    sample.copy_from_slice(&(value << 6).to_le_bytes());
+                }
+            }
+        }
+        // SAFETY: the buffer was mapped above and the slice is no longer used.
+        let st = unsafe { (api.unmap_buffer)(dpy, image.buf) };
+        session.display.check(st, "vaUnmapBuffer").unwrap();
+        let (w, h) = session.size;
+        // SAFETY: the surface and image belong to this session and have matching size and format.
+        let st = unsafe { (api.put_image)(dpy, session.surfaces[index], image.image_id, 0, 0, w, h, 0, 0, w, h) };
+        session.display.check(st, "vaPutImage").unwrap();
+    }
+
+    fn check_image_ring(bits: u32, profile: ffi::VAProfile) {
+        let geometry = Geometry { crop: (1, 1, 61, 61), bits, color: filmcraft_color::ColorInfo::REC709, par: (4, 3) };
+        let mut session = match Session::new(&[profile], (64, 64), 2, geometry) {
+            Ok(session) => session,
+            Err(why) => {
+                eprintln!("SKIPPED: no {bits}-bit VA-API session: {why}");
+                return;
+            }
+        };
+        session.derive_supported = Some(false);
+        assert!(session.images.iter().all(Option::is_none));
+        write_test_surface(&mut session, 0, 48);
+        write_test_surface(&mut session, 1, 192);
+        assert_eq!(session.images.iter().flatten().count(), 1);
+
+        // Reference behaviour: reuse the same image for every synchronous readback.
+        let reference: Vec<_> = (0..2)
+            .map(|index| {
+                session.next_image = 0;
+                session.read(index).unwrap()
+            })
+            .collect();
+        assert_ne!(planes(&reference[0]), planes(&reference[1]));
+
+        session.next_image = 0;
+        for _ in 0..3 {
+            let first = session.get_image(0).unwrap();
+            let second = session.get_image(1).unwrap();
+            assert_ne!(first.image_id, second.image_id, "the next readback must not overwrite the previous image");
+            assert_eq!(session.images.iter().flatten().count(), IMAGE_RING_SIZE);
+            for (image, expected) in [first, second].iter().zip(&reference) {
+                let frame = session.read_image(image).unwrap();
+                assert_eq!(planes(&frame), planes(expected));
+                assert_eq!(
+                    (frame.width, frame.height, frame.color, frame.par, frame.pts),
+                    (expected.width, expected.height, expected.color, expected.par, expected.pts)
+                );
+            }
+        }
+        for index in [0, 1, 0, 1, 0, 1] {
+            assert_eq!(planes(&session.read(index).unwrap()), planes(&reference[index]));
+        }
+    }
+
+    #[test]
+    fn hardware_nv12_image_ring_matches_single_image_readback() {
+        check_image_ring(8, ffi::VAProfileH264High);
+    }
+
+    #[test]
+    fn hardware_p010_image_ring_matches_single_image_readback() {
+        check_image_ring(10, ffi::VAProfileHEVCMain10);
     }
 
     fn check_bulk_copy(bits: u32, unequal_pitches: bool) {

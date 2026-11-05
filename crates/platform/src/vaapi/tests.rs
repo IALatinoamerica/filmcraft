@@ -24,6 +24,9 @@ struct Recorder {
     ids: Vec<ffi::VASurfaceID>,
     decoded: Vec<bool>,
     pictures: usize,
+    generations: Vec<usize>,
+    reads: Vec<usize>,
+    fail_read: bool,
     frame: VideoFrame,
 }
 
@@ -31,7 +34,15 @@ impl Recorder {
     fn new(count: usize) -> Self {
         let g = Geometry { crop: (0, 0, 2, 2), bits: 8, color: Default::default(), par: (1, 1) };
         let frame = biplanar::to_frame(&Biplanar { luma: &[128; 4], chroma: &[128; 2], stride: 2, rows: 2 }, &g).unwrap();
-        Self { ids: (0..count as u32).map(|i| 0x100 + i).collect(), decoded: vec![false; count], pictures: 0, frame }
+        Self {
+            ids: (0..count as u32).map(|i| 0x100 + i).collect(),
+            decoded: vec![false; count],
+            pictures: 0,
+            generations: vec![0; count],
+            reads: Vec::new(),
+            fail_read: false,
+            frame,
+        }
     }
 }
 
@@ -86,6 +97,7 @@ impl Accel for Recorder {
         }
         self.decoded[target] = true;
         self.pictures += 1;
+        self.generations[target] = self.pictures;
         Ok(())
     }
 
@@ -125,11 +137,16 @@ impl Accel for Recorder {
         }
         self.decoded[target] = true;
         self.pictures += 1;
+        self.generations[target] = self.pictures;
         Ok(())
     }
 
     fn read(&mut self, index: usize) -> Result<VideoFrame, String> {
+        if self.fail_read {
+            return Err("readback failed".into());
+        }
         assert!(self.decoded[index], "read back a decoded surface");
+        self.reads.push(self.generations[index]);
         Ok(self.frame.clone())
     }
 
@@ -377,5 +394,197 @@ fn hevc_damaged_samples_are_errors() {
             }
         }
         let _ = f.flush();
+    }
+}
+
+#[test]
+fn pipeline_depth_and_surface_count() {
+    use super::{DEFAULT_READBACK_DEPTH, readback_depth, surface_count};
+    assert_eq!(DEFAULT_READBACK_DEPTH, 3);
+    assert_eq!(readback_depth(None), 3);
+    for invalid in ["", "bad", "-1", "1.5", "999999999999999999999999999999999999999"] {
+        assert_eq!(readback_depth(Some(invalid)), 3, "{invalid}");
+    }
+    for depth in [0, 2, 3, 4, 24] {
+        assert_eq!(readback_depth(Some(&depth.to_string())), depth);
+        assert_eq!(surface_count(16, depth), (18 + depth).min(24));
+    }
+    assert_eq!(surface_count(16, usize::MAX), 24);
+}
+
+#[test]
+fn pending_readbacks_fifo_threshold_flush_and_holds() {
+    let mut queue = super::PendingReadbacks::new(4, 2);
+    let mut accel = Recorder::new(4);
+    accel.decoded.fill(true);
+    let mut frames = Vec::new();
+    // Surface order and PTS are independent: retain insertion order, never sort them.
+    for (surface, pts) in [(2, 70), (0, 10)] {
+        queue.enqueue(surface, pts).unwrap();
+        queue.read(&mut accel, &mut frames, false, |pts| *pts).unwrap();
+        assert!(frames.is_empty());
+        assert!(queue.is_pending(surface));
+    }
+    queue.enqueue(3, 40).unwrap();
+    queue.read(&mut accel, &mut frames, false, |pts| *pts).unwrap();
+    assert_eq!(pts(&frames), [70]);
+    assert!(!queue.is_pending(2));
+    assert!(queue.is_pending(0) && queue.is_pending(3));
+    queue.read(&mut accel, &mut frames, true, |pts| *pts).unwrap();
+    assert_eq!(pts(&frames), [70, 10, 40]);
+    assert!(queue.queue.is_empty());
+    assert!(queue.pending_readback.iter().all(|held| !held));
+    queue.read(&mut accel, &mut frames, true, |pts| *pts).unwrap();
+    assert_eq!(frames.len(), 3, "second flush is empty");
+}
+
+#[test]
+fn pending_readbacks_reset_releases_all_holds_without_reading() {
+    let mut queue = super::PendingReadbacks::new(3, 3);
+    for surface in 0..3 {
+        queue.enqueue(surface, surface as i64).unwrap();
+    }
+    assert!((0..3).all(|surface| queue.is_pending(surface)));
+    queue.reset();
+    assert!(queue.queue.is_empty());
+    assert!((0..3).all(|surface| !queue.is_pending(surface)));
+    queue.enqueue(0, 42).unwrap();
+    assert!(queue.is_pending(0));
+}
+
+#[test]
+fn pending_readbacks_zero_depth_and_failed_read_hold() {
+    let mut queue = super::PendingReadbacks::new(1, 0);
+    let mut accel = Recorder::new(1);
+    accel.decoded[0] = true;
+    accel.fail_read = true;
+    queue.enqueue(0, 17).unwrap();
+    let mut frames = Vec::new();
+    assert!(queue.read(&mut accel, &mut frames, false, |pts| *pts).is_err());
+    assert!(frames.is_empty());
+    assert!(queue.is_pending(0));
+    assert_eq!(queue.queue.len(), 1);
+    accel.fail_read = false;
+    queue.read(&mut accel, &mut frames, false, |pts| *pts).unwrap();
+    assert_eq!(pts(&frames), [17]);
+    assert!(!queue.is_pending(0));
+}
+
+#[test]
+fn h264_pipeline_matches_immediate_readback_and_reset() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    for (name, profile, params) in STREAMS {
+        let Some(path) = fixture(&ff, name, profile, params) else { continue };
+        let s = read_stream(&path);
+        let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
+        let make = |depth| {
+            Front::new_with_depth(
+                Recorder::new(super::surface_count(16, depth)),
+                info.length_size,
+                (info.coded.0 / 16, info.coded.1 / 16),
+                &info.parameter_sets,
+                depth,
+            )
+            .unwrap()
+        };
+        for depth in [2, 3, 4] {
+            let (mut immediate, mut delayed) = (make(0), make(depth));
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let mid = 10;
+            for (sample, pts_) in &s.samples[..mid] {
+                a.extend(pts(&immediate.decode(sample, *pts_).unwrap()));
+                b.extend(pts(&delayed.decode(sample, *pts_).unwrap()));
+            }
+            assert_eq!(a.len() - b.len(), depth, "{name}: queue is nonempty before reset");
+            assert_eq!(delayed.accel().reads, immediate.accel().reads[..b.len()]);
+            // Discard queued pictures and seek to the next sync sample.
+            immediate.reset();
+            delayed.reset();
+            let start = (mid..s.samples.len()).find(|&i| s.sync[i]).unwrap();
+            let offset_a = immediate.accel().reads.len();
+            let offset_b = delayed.accel().reads.len();
+            assert_eq!(run_front(&mut delayed, &s.samples[start..]), run_front(&mut immediate, &s.samples[start..]), "{name}: reset/seek");
+            assert_eq!(delayed.accel().reads[offset_b..], immediate.accel().reads[offset_a..], "{name}: surfaces survive holds");
+            assert!(delayed.flush().unwrap().is_empty());
+            // Full stream, including EOS flush, after another reset.
+            immediate.reset();
+            delayed.reset();
+            let offset_a = immediate.accel().reads.len();
+            let offset_b = delayed.accel().reads.len();
+            assert_eq!(run_front(&mut delayed, &s.samples), run_front(&mut immediate, &s.samples), "{name}: EOS");
+            assert_eq!(delayed.accel().reads[offset_b..], immediate.accel().reads[offset_a..]);
+        }
+        let mut held = make(usize::MAX);
+        assert!(
+            s.samples
+                .iter()
+                .any(|(sample, pts)| matches!(held.decode(sample, *pts), Err(filmcraft_codecs::CodecError::Decode(why)) if why == "no free surface")),
+            "{name}: all surfaces held returns a codec error"
+        );
+        let mut skipped = make(3);
+        skipped.set_output_floor(Some(i64::MAX));
+        assert!(run_front(&mut skipped, &s.samples).is_empty());
+        assert!(skipped.accel().reads.is_empty(), "{name}: below-floor outputs never read back");
+        skipped.set_output_floor(None);
+        assert!(skipped.flush().unwrap().is_empty(), "{name}: no below-floor outputs were queued");
+    }
+}
+
+#[test]
+fn hevc_pipeline_matches_immediate_readback_and_reset() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    for (name, pix_fmt, params) in HEVC_STREAMS {
+        let Some(path) = hevc_fixture(&ff, name, pix_fmt, params) else { continue };
+        let s = read_stream(&path);
+        let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
+        let make = |depth| {
+            super::hevc::Front::new_with_depth(
+                Recorder::new(super::surface_count(16, depth)),
+                info.length_size,
+                info.coded,
+                info.bit_depth_luma,
+                &info.parameter_sets,
+                depth,
+            )
+            .unwrap()
+        };
+        for depth in [2, 3, 4] {
+            let (mut immediate, mut delayed) = (make(0), make(depth));
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let mid = 10;
+            for (sample, pts_) in &s.samples[..mid] {
+                a.extend(pts(&immediate.decode(sample, *pts_).unwrap()));
+                b.extend(pts(&delayed.decode(sample, *pts_).unwrap()));
+            }
+            assert_eq!(a.len() - b.len(), depth, "{name}: queue is nonempty before reset");
+            assert_eq!(delayed.accel().reads, immediate.accel().reads[..b.len()]);
+            immediate.reset();
+            delayed.reset();
+            let start = (mid..s.samples.len()).find(|&i| s.sync[i]).unwrap();
+            let offset_a = immediate.accel().reads.len();
+            let offset_b = delayed.accel().reads.len();
+            assert_eq!(run_hevc(&mut delayed, &s.samples[start..]), run_hevc(&mut immediate, &s.samples[start..]), "{name}: reset/seek");
+            assert_eq!(delayed.accel().reads[offset_b..], immediate.accel().reads[offset_a..], "{name}: surfaces survive holds");
+            assert!(delayed.flush().unwrap().is_empty());
+            immediate.reset();
+            delayed.reset();
+            let offset_a = immediate.accel().reads.len();
+            let offset_b = delayed.accel().reads.len();
+            assert_eq!(run_hevc(&mut delayed, &s.samples), run_hevc(&mut immediate, &s.samples), "{name}: EOS");
+            assert_eq!(delayed.accel().reads[offset_b..], immediate.accel().reads[offset_a..]);
+        }
+        let mut held = make(usize::MAX);
+        assert!(
+            s.samples
+                .iter()
+                .any(|(sample, pts)| matches!(held.decode(sample, *pts), Err(filmcraft_codecs::CodecError::Decode(why)) if why == "no free surface")),
+            "{name}: all surfaces held returns a codec error"
+        );
+        let mut skipped = make(3);
+        skipped.set_output_floor(Some(i64::MAX));
+        assert!(run_hevc(&mut skipped, &s.samples).is_empty());
+        assert!(skipped.accel().reads.is_empty());
+        skipped.set_output_floor(None);
+        assert!(skipped.flush().unwrap().is_empty(), "{name}: no below-floor outputs were queued");
     }
 }

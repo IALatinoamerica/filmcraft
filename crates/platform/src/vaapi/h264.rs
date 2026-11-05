@@ -19,8 +19,8 @@ use filmcraft_h264::dpb::{Dpb, DpbEntry, Output, OutputMeta, RefMark};
 use filmcraft_h264::params::{Pps, Sps};
 use filmcraft_h264::slice::{NalHeader, Poc, PocState, SliceHeader, SliceType, is_new_picture, nal_type};
 
-use super::Accel;
 use super::ffi::{self, VAIQMatrixBufferH264, VAPictureH264, VAPictureParameterBufferH264, VASliceParameterBufferH264, pic_bits, seq_bits};
+use super::{Accel, DEFAULT_READBACK_DEPTH, PendingReadbacks};
 
 /// A picture in the DPB: its surface, field order counts (after an MMCO 5, relative to itself) and
 /// place in decoding order.
@@ -51,6 +51,7 @@ pub struct Front<A: Accel> {
     accel: A,
     length_size: usize,
     output_floor: Option<i64>,
+    readbacks: PendingReadbacks<Arc<OutputMeta>>,
     /// Coded size (macroblocks) the surfaces were made for.
     mbs: (u32, u32),
     spss: Vec<Option<Arc<Sps>>>,
@@ -77,10 +78,17 @@ impl<A: Accel> Front<A> {
     /// carried `parameter_sets` (SPS / PPS NAL units), decoding into `accel`'s surfaces of
     /// `mbs` macroblocks.
     pub fn new(accel: A, length_size: usize, mbs: (u32, u32), parameter_sets: &[Vec<u8>]) -> Result<Self> {
+        Self::new_with_depth(accel, length_size, mbs, parameter_sets, DEFAULT_READBACK_DEPTH)
+    }
+
+    /// Construct with an explicit readback depth, without reading process environment.
+    pub fn new_with_depth(accel: A, length_size: usize, mbs: (u32, u32), parameter_sets: &[Vec<u8>], depth: usize) -> Result<Self> {
+        let readbacks = PendingReadbacks::new(accel.surfaces().len(), depth);
         let mut f = Self {
             accel,
             length_size,
             output_floor: None,
+            readbacks,
             mbs,
             spss: vec![None; 32],
             ppss: vec![None; 256],
@@ -111,7 +119,7 @@ impl<A: Accel> Front<A> {
         self.output_floor = pts;
     }
 
-    /// Decode one access unit; pictures that left the DPB come back in output order.
+    /// Decode one access unit; return DPB outputs in order after the readback delay.
     pub fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
         let nals = length_prefixed_nals(sample, self.length_size).map_err(decode_err)?;
         let mut frames = Vec::new();
@@ -123,18 +131,20 @@ impl<A: Accel> Front<A> {
         Ok(frames)
     }
 
-    /// Output every picture still held for reordering (references stay for what follows).
+    /// Drain reordering and pending readbacks (references stay for what follows).
     pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         self.submit_pending(&mut frames)?;
         let mut outs = Vec::new();
         self.dpb.flush(&mut outs);
         self.read_out(outs, &mut frames)?;
+        self.readbacks.read(&mut self.accel, &mut frames, true, |meta| meta.pts)?;
         Ok(frames)
     }
 
     /// Forget every picture (after a seek).
     pub fn reset(&mut self) {
+        self.readbacks.reset();
         self.dpb = Dpb::new();
         self.poc_state = PocState::default();
         self.prev_ref_frame_num = 0;
@@ -142,17 +152,15 @@ impl<A: Accel> Front<A> {
         self.pending = None;
     }
 
-    /// Read back the pictures the DPB output, right away: a surface leaving the DPB is reused by
-    /// the next picture.
+    /// Skip unwanted outputs before taking a readback hold on their surfaces.
     fn read_out(&mut self, outs: Vec<Output<Surface>>, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         for o in outs {
             if self.output_floor.is_some_and(|floor| o.meta.pts < floor) {
                 continue;
             }
-            let frame = self.accel.read(o.frame.index).map_err(decode_err)?;
-            frames.push(DecodedFrame { pts: o.meta.pts, frame, draft: false });
+            self.readbacks.enqueue(o.frame.index, o.meta)?;
         }
-        Ok(())
+        self.readbacks.read(&mut self.accel, frames, false, |meta| meta.pts)
     }
 
     fn handle_nal(&mut self, nal: &[u8], pts: i64, frames: &mut Vec<DecodedFrame>) -> Result<()> {
@@ -270,8 +278,9 @@ impl<A: Accel> Front<A> {
         }
         self.read_out(outs, frames)?;
         let poc = self.poc_state.compute(sh, sps);
-        let target =
-            (0..self.accel.surfaces().len()).find(|&i| !self.dpb.entries.iter().any(|e| e.frame.index == i)).ok_or_else(|| decode_err("no free surface"))?;
+        let target = (0..self.accel.surfaces().len())
+            .find(|&i| !self.readbacks.is_pending(i) && !self.dpb.entries.iter().any(|e| e.frame.index == i))
+            .ok_or_else(|| decode_err("no free surface"))?;
         self.pending = Some(Pending { target, sps: sps.clone(), pps: pps.clone(), first: sh.clone(), poc, pts, slices: Vec::new() });
         Ok(())
     }
@@ -290,7 +299,7 @@ impl<A: Accel> Front<A> {
         self.dpb.fill_frame_num_gap(self.prev_ref_frame_num, sh.frame_num, max, sps.max_num_ref_frames as usize, &mut make, &mut update);
         self.prev_ref_frame_num = (sh.frame_num + max - 1) % max;
         let used: Vec<usize> = self.dpb.entries.iter().map(|e| e.frame.index).filter(|&i| i != UNASSIGNED).collect();
-        let mut free = (0..self.accel.surfaces().len()).filter(|i| !used.contains(i));
+        let mut free = (0..self.accel.surfaces().len()).filter(|i| !self.readbacks.is_pending(*i) && !used.contains(i));
         let mut fills = Vec::new();
         for e in self.dpb.entries.iter_mut().filter(|e| e.frame.index == UNASSIGNED) {
             let index = free.next().ok_or_else(|| decode_err("no free surface for a frame_num gap"))?;
@@ -324,7 +333,16 @@ impl<A: Accel> Front<A> {
             BottomFieldOrderCnt: p.poc.bottom,
             va_reserved: [0; ffi::VA_PADDING_LOW],
         };
-        for (slot, e) in pic.ReferenceFrames.iter_mut().zip(self.dpb.entries.iter().filter(|e| e.mark != RefMark::Unused)) {
+        // Gap entries track frame_num, but their filled surfaces have no decoded reference
+        // metadata. Expose them to the driver only when a slice needs their concealment pixels.
+        let refs = self.dpb.entries.iter().filter(|e| {
+            e.mark != RefMark::Unused
+                && (!e.non_existing
+                    || p.slices.iter().any(|(slice, _)| {
+                        slice.RefPicList0.iter().chain(&slice.RefPicList1).any(|r| surfaces.get(e.frame.index).is_some_and(|&id| r.picture_id == id))
+                    }))
+        });
+        for (slot, e) in pic.ReferenceFrames.iter_mut().zip(refs) {
             *slot = va_ref(e, surfaces);
         }
         let iq = iq_matrix(&p.pps);

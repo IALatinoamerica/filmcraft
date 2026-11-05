@@ -534,6 +534,52 @@ fn concurrent_hits_finish_while_decode_is_blocked_and_mixed_requests_stay_correc
 }
 
 #[test]
+fn pending_readbacks_preserve_frames_pts_and_order_through_seeks_and_eos() {
+    let run = |depth| {
+        // Dec already models the readback FIFO: retain D pictures, emit the oldest when
+        // its length exceeds D, drain on flush, and discard pending pictures on reset.
+        let s = samples(48, 16, depth, false);
+        let c = GopCache::new(None);
+        let mut frames = Vec::new();
+        for (request, i) in [20usize, 21, 5, 6].into_iter().chain(7..48).enumerate() {
+            let pts = i as i64 * 1000;
+            let taken = c.frame_late_locked(&s, pts, None).expect("readback frame");
+            assert_eq!(taken.pts, pts, "must return the target, not an earlier cached frame");
+            assert_eq!(index_of(&taken.frame), i);
+            frames.push((taken.pts, frame_bytes(&taken.frame)));
+            if request < 4 {
+                let st = c.shared.state.lock().unwrap();
+                assert_eq!(st.next, i + depth + 1, "stop feeding as soon as the target is cached");
+                assert_eq!(st.out_max, pts);
+                assert_eq!(s.resets.load(Ordering::Relaxed), if i >= 20 { 1 } else { 2 });
+                if depth > 0 {
+                    // The next requested target has already been submitted and is still in
+                    // the queue. It must continue this run without resetting the decoder.
+                    assert!(st.next > i + 1);
+                    assert!(c.shared.frames.lock().unwrap().cached(pts + 1000, false).is_none());
+                }
+            }
+            if depth > 0 && i == 45 {
+                // All samples were fed, but 45..47 were pending: EOS must drain them and
+                // invalidate the run (HEVC flush ends it). The last two requests are hits.
+                let st = c.shared.state.lock().unwrap();
+                assert_eq!(st.next, usize::MAX);
+                assert_eq!(st.out_max, 47_000);
+                let cached = c.shared.frames.lock().unwrap();
+                assert!(cached.cached(46_000, false).is_some());
+                assert!(cached.cached(47_000, false).is_some());
+            }
+        }
+        // Seek 5 resets while 22..24 are pending at D=3. Subsequent playback, including
+        // crossing the next GOP, must not restart or re-feed any samples.
+        assert_eq!(s.resets.load(Ordering::Relaxed), 2);
+        assert_eq!(s.decodes.load(Ordering::Relaxed), 6 + depth + 48);
+        frames
+    };
+    assert_eq!(run(3), run(0));
+}
+
+#[test]
 fn frames_held_by_a_threaded_decoder_do_not_restart_it() {
     // 24 pictures in flight (more than any fixed look-ahead margin), one long GOP.
     let s = samples(300, 250, 24, false);
