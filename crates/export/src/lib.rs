@@ -52,6 +52,7 @@ mod output;
 mod registry;
 mod run;
 mod stats;
+pub use stats::outside_times;
 mod still_encode;
 
 pub use convert::{

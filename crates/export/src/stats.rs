@@ -1,5 +1,92 @@
 use super::Ordering;
 
+/// Export wall clocks, separate from the accumulated frame-task intervals.
+#[derive(Clone, Copy)]
+pub(crate) enum Outside {
+    Wall,
+    BatchWall,
+    BatchIdle,
+    BetweenBatches,
+    EncoderBackpressure,
+    AfterLastBatch,
+}
+
+static OUTSIDE_NS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+pub(crate) fn note_outside(timer: Outside, d: std::time::Duration) {
+    if let Some(counter) = OUTSIDE_NS.get(timer as usize) {
+        counter.fetch_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+/// Cumulative nanoseconds outside frame tasks. BatchIdle is wall time with no active frame
+/// tasks inside a batch; BetweenBatches covers setup before the first batch and gaps between
+/// batches. EncoderBackpressure is the subset of those gaps after render finishes before encode.
+pub fn outside_times() -> Vec<(&'static str, u64)> {
+    ["wallMs", "batchWallMs", "batchIdleMs", "betweenBatchMs", "encoderBackpressureMs", "afterLastBatchMs"]
+        .into_iter()
+        .zip(OUTSIDE_NS.iter().map(|a| a.load(Ordering::Relaxed)))
+        .collect()
+}
+
+struct BatchState {
+    active: usize,
+    since: web_time::Instant,
+    idle: std::time::Duration,
+}
+
+/// One cheap lock at each frame-task boundary; no per-pixel or per-row instrumentation.
+pub(crate) struct BatchClock<'a> {
+    start: web_time::Instant,
+    previous_end: &'a std::sync::Mutex<web_time::Instant>,
+    state: std::sync::Mutex<BatchState>,
+}
+
+impl<'a> BatchClock<'a> {
+    pub(crate) fn new(previous_end: &'a std::sync::Mutex<web_time::Instant>) -> Self {
+        let start = web_time::Instant::now();
+        let previous = *previous_end.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        note_outside(Outside::BetweenBatches, start.saturating_duration_since(previous));
+        Self { start, previous_end, state: std::sync::Mutex::new(BatchState { active: 0, since: start, idle: std::time::Duration::ZERO }) }
+    }
+
+    pub(crate) fn task(&self) -> ActiveTask<'_> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = web_time::Instant::now();
+        if state.active == 0 {
+            let idle = now.saturating_duration_since(state.since);
+            state.idle += idle;
+        }
+        state.active = state.active.saturating_add(1);
+        ActiveTask(self)
+    }
+}
+
+pub(crate) struct ActiveTask<'a>(&'a BatchClock<'a>);
+
+impl Drop for ActiveTask<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            state.since = web_time::Instant::now();
+        }
+    }
+}
+
+impl Drop for BatchClock<'_> {
+    fn drop(&mut self) {
+        let now = web_time::Instant::now();
+        let state = self.state.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active == 0 {
+            state.idle += now.saturating_duration_since(state.since);
+        }
+        note_outside(Outside::BatchWall, now.saturating_duration_since(self.start));
+        note_outside(Outside::BatchIdle, state.idle);
+        *self.previous_end.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+    }
+}
+
 /// Hardware encoder counters (`perf.stats` `export.hardware`): pictures encoded by hardware
 /// encoders, encoders created, and requests a hardware encoder declined (the software encoder
 /// took them).

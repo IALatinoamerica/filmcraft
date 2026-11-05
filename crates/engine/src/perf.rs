@@ -73,7 +73,11 @@ pub fn export_json() -> Value {
     let hw = filmcraft_export::hw_encode_stats();
     let stages: serde_json::Map<String, Value> =
         filmcraft_export::stage_times().into_iter().map(|(s, ns)| (format!("{}Ms", s.name()), json!(ns as f64 / 1e6))).collect();
-    json!({"hardware": {"frames": hw.frames, "sessions": hw.sessions, "declined": hw.declined}, "stages": stages})
+    let render_tasks: serde_json::Map<String, Value> =
+        filmcraft_frame::render_timing::times().into_iter().map(|(name, ns)| (name.to_owned(), json!(ns as f64 / 1e6))).collect();
+    let outside: serde_json::Map<String, Value> =
+        filmcraft_export::outside_times().into_iter().map(|(name, ns)| (name.to_owned(), json!(ns as f64 / 1e6))).collect();
+    json!({"hardware": {"frames": hw.frames, "sessions": hw.sessions, "declined": hw.declined}, "stages": stages, "renderTasks": render_tasks, "outside": outside})
 }
 
 /// The engine's `perf.stats`.
@@ -140,6 +144,12 @@ mod tests {
         }
         for k in ["setupMs", "loudnessMs", "renderMs", "encodeMs", "convertMs", "audioMs", "muxMs", "finishMs", "waitMs"] {
             assert!(v["export"]["stages"][k].is_number(), "export.stages.{k} in {v}");
+        }
+        for (name, _) in filmcraft_frame::render_timing::times() {
+            assert!(v["export"]["renderTasks"][name].is_number(), "renderTasks.{name}");
+        }
+        for (name, _) in filmcraft_export::outside_times() {
+            assert!(v["export"]["outside"][name].is_number(), "outside.{name}");
         }
         assert!(v["media"]["openSources"].is_number());
         assert_eq!(v["jobs"]["running"], json!(0));

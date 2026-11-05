@@ -279,6 +279,7 @@ impl Pipeline {
         self.overlays(&mut img, t);
         let lim = &self.effects.video_limiter;
         if let Some(tf) = self.out_tf.as_ref().filter(|_| self.hdr_out) {
+            let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
             let mut out = vec![0f32; img.w * img.h * 3];
             out.par_chunks_mut(img.w * 3).zip(img.px.par_chunks(img.w * 4)).for_each(|(o, s)| {
                 for (o, p) in o.as_chunks_mut::<3>().0.iter_mut().zip(s.as_chunks::<4>().0) {
@@ -296,6 +297,7 @@ impl Pipeline {
         // the float image is not needed any more: its buffer serves the next frame's layers
         filmcraft_frame::pool::recycle_f32(img.px);
         if lim.enabled {
+            let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Effects);
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
         (rgba, Vec::new())
@@ -303,6 +305,7 @@ impl Pipeline {
 
     /// Fit the rendered picture into the output frame.
     fn place(&self, img: Image) -> Image {
+        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Composite);
         let (w, h) = (self.w as usize, self.h as usize);
         let img = match self.geom.content {
             Some((cw, ch)) if (cw, ch) != (img.w, img.h) => resample(&img, cw, ch),
@@ -331,6 +334,7 @@ impl Pipeline {
     }
 
     fn overlays(&self, img: &mut Image, t: filmcraft_time::Tick) {
+        let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Effects);
         let fx = &self.effects;
         if let Some(ov) = &self.overlay {
             let o = &fx.image_overlay;

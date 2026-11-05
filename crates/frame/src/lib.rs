@@ -8,6 +8,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod pool;
+pub mod render_timing;
 
 use std::sync::Arc;
 
@@ -290,6 +291,7 @@ impl VideoFrame {
     /// `decode` (a colour-managed curve: log, PQ, HLG scene light…) instead of the frame's
     /// transfer. Float frames are already linear and ignore it.
     pub fn to_linear_f32_decimated_with(&self, n: usize, decode: Option<&DecodeTable>) -> (usize, usize, Vec<f32>) {
+        let _time = render_timing::enter(render_timing::Phase::Convert);
         let n = self.bounded_decimation(n);
         let (ow, oh) = self.decimated_size(n);
         // every element is written below, so a recycled buffer needs no zero-fill
@@ -309,6 +311,7 @@ impl VideoFrame {
     /// by row. Each pixel is exactly what the full conversion gives at that position. The buffer
     /// may come from the pool ([`pool::recycle_f32`] hands it back).
     pub fn to_linear_f32_region(&self, n: usize, decode: Option<&DecodeTable>, region: Region) -> (Region, Vec<f32>) {
+        let _time = render_timing::enter(render_timing::Phase::Convert);
         let n = self.bounded_decimation(n);
         let (ow, oh) = self.decimated_size(n);
         let r = region.clip(ow, oh);
@@ -662,6 +665,7 @@ impl VideoFrame {
 
     /// Convert to straight-alpha sRGB RGBA8 for display (fast paths for 8-bit sources).
     pub fn to_rgba8(&self) -> Vec<u8> {
+        let _time = render_timing::enter(render_timing::Phase::Convert);
         let (w, h) = (self.width as usize, self.height as usize);
         match &self.data {
             PixelData::Rgba8(d) => d.as_ref().clone(),

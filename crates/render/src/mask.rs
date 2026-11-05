@@ -187,6 +187,7 @@ pub fn scale_by(img: &mut Image, cov: &[f32]) {
 
 /// Apply an effect limited to its masks (Premiere: a masked effect only applies inside the mask).
 pub fn apply_effect(img: &mut Image, e: &EffectInstance, cx: &crate::effects::FxCtx) {
+    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Effects);
     if !e.enabled || e.masks.is_empty() {
         crate::effects::apply(img, e, cx);
         return;
@@ -202,6 +203,7 @@ pub fn apply_effect(img: &mut Image, e: &EffectInstance, cx: &crate::effects::Fx
 
 /// Apply the masks of an item's Opacity effect to its layer (before Motion), if any.
 pub fn apply_opacity_masks(img: &mut Image, item: &filmcraft_project::TrackItem, t: Tick, px_scale: f32) {
+    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Effects);
     let Some(op) = item.effect("opacity").filter(|e| e.enabled && !e.masks.is_empty()) else { return };
     if let Some(cov) = effect_coverage(&op.masks, t, px_scale, img.w, img.h) {
         scale_by(img, &cov);

@@ -60,8 +60,8 @@
 //!   waiting for the render (large: render-bound; near zero: encode-bound).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use filmcraft_isobmff::{Brand, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use filmcraft_project::{ItemId, Project};
@@ -115,20 +115,33 @@ struct Ahead {
 /// must be rendered again.
 /// `prepare` (the encoder's [`VideoEncoder::prepare_ahead`]) then works on each frame, numbered
 /// from `f0` like [`EncoderFrame::index`].
-fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider, prepare: Option<&PrepareAhead>, f0: i64) -> Option<Vec<Frame>> {
+fn render_batch(
+    pipe: &Pipeline,
+    f: i64,
+    end: i64,
+    sources: &dyn SourceProvider,
+    prepare: Option<&PrepareAhead>,
+    f0: i64,
+    batch_end: &Mutex<web_time::Instant>,
+) -> Option<Vec<Frame>> {
+    let batch_clock = crate::stats::BatchClock::new(batch_end);
     let pending = AtomicBool::new(false);
     let frames: Vec<Frame> = (f..end)
         .into_par_iter()
         .map(|fi| {
-            let frame = filmcraft_media::cancel::with_export(true, || pipe.frame(fi, sources));
-            if filmcraft_media::pending::take() {
-                pending.store(true, Ordering::Relaxed);
-            }
-            if let Some(prepare) = prepare {
-                let index = u64::try_from(fi - f0).unwrap_or(u64::MAX);
-                prepare(&EncoderFrame { width: pipe.w, height: pipe.h, rgba: &frame.0, hdr: pipe.hdr_out.then_some(frame.1.as_slice()), index });
-            }
-            frame
+            let _active = batch_clock.task();
+            filmcraft_frame::render_timing::task(|| {
+                let frame = filmcraft_media::cancel::with_export(true, || pipe.frame(fi, sources));
+                if filmcraft_media::pending::take() {
+                    pending.store(true, Ordering::Relaxed);
+                }
+                if let Some(prepare) = prepare {
+                    let _convert = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Convert);
+                    let index = u64::try_from(fi - f0).unwrap_or(u64::MAX);
+                    prepare(&EncoderFrame { width: pipe.w, height: pipe.h, rgba: &frame.0, hdr: pipe.hdr_out.then_some(frame.1.as_slice()), index });
+                }
+                frame
+            })
         })
         .collect();
     (!pending.load(Ordering::Relaxed)).then_some(frames)
@@ -189,6 +202,7 @@ pub struct Exporter {
     vt: usize,
     at: Option<usize>,
     t0: web_time::Instant,
+    batch_end: Arc<Mutex<web_time::Instant>>,
 }
 
 impl Drop for Exporter {
@@ -295,6 +309,7 @@ impl Exporter {
             _ => None,
         };
         let measured = !settings.effects.loudness.enabled || audio.is_none();
+        let t0 = web_time::Instant::now();
         Ok(Self {
             schedule: (std::env::var_os("FILMCRAFT_EXPORT_SCHEDULER").as_deref() != Some(std::ffi::OsStr::new("0")) && !cfg!(target_arch = "wasm32"))
                 .then(|| crate::schedule::Scheduler::new(pipe.clone())),
@@ -320,7 +335,8 @@ impl Exporter {
             project: project.clone(),
             vt: 0,
             at: None,
-            t0: web_time::Instant::now(),
+            t0,
+            batch_end: Arc::new(Mutex::new(t0)),
             settings,
         })
     }
@@ -560,7 +576,12 @@ impl Exporter {
             }
         };
         note_stage(Stage::Finish, finishing.elapsed());
-        let secs = self.t0.elapsed().as_secs_f64();
+        let finished = web_time::Instant::now();
+        let last_batch = *self.batch_end.lock().unwrap_or_else(PoisonError::into_inner);
+        crate::stats::note_outside(crate::stats::Outside::AfterLastBatch, finished.saturating_duration_since(last_batch));
+        let wall = finished.saturating_duration_since(self.t0);
+        crate::stats::note_outside(crate::stats::Outside::Wall, wall);
+        let secs = wall.as_secs_f64();
         let nframes = self.frames();
         if !self.settings.part_of_batch {
             progress.finished.store(true, Ordering::Relaxed);
@@ -585,7 +606,7 @@ impl Exporter {
             _ => {
                 let (f, end) = (self.next, self.next.saturating_add(self.batch_len()).min(self.f1));
                 let pipe = &self.pipe;
-                match timed(Stage::Render, || render_batch(pipe, f, end, sources, prepare.as_ref(), f0)) {
+                match timed(Stage::Render, || render_batch(pipe, f, end, sources, prepare.as_ref(), f0, &self.batch_end)) {
                     Some(frames) => (f, frames),
                     None => return Ok(Step::Pending),
                 }
@@ -611,11 +632,14 @@ impl Exporter {
         let pipe = self.pipe.clone();
         let mut slot: Option<std::thread::Result<Option<Vec<Frame>>>> = None;
         let mut encode_done: Option<web_time::Instant> = None;
+        let mut render_done: Option<web_time::Instant> = None;
+        let batch_end = self.batch_end.clone();
         let encoded = rayon::in_place_scope(|s| {
             s.spawn(|_| {
                 slot = Some(catch_unwind(AssertUnwindSafe(|| {
-                    filmcraft_media::cancel::with_export(true, || timed(Stage::Render, || render_batch(&pipe, a, b, sources, prepare.as_ref(), f0)))
+                    filmcraft_media::cancel::with_export(true, || timed(Stage::Render, || render_batch(&pipe, a, b, sources, prepare.as_ref(), f0, &batch_end)))
                 })));
+                render_done = Some(web_time::Instant::now());
             });
             let r = self.encode_batch(f, frames, sources);
             encode_done = Some(web_time::Instant::now());
@@ -624,6 +648,9 @@ impl Exporter {
         // the scope returned only now: what is left since the encoding ended is waiting for the render
         if let Some(t) = encode_done {
             note_stage(Stage::Wait, t.elapsed());
+        }
+        if let (Some(render), Some(encode)) = (render_done, encode_done) {
+            crate::stats::note_outside(crate::stats::Outside::EncoderBackpressure, encode.saturating_duration_since(render));
         }
         match encoded? {
             Encoded::Pending => Ok(Step::Pending),

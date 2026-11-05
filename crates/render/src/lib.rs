@@ -338,6 +338,7 @@ fn is_adjustment(project: &Project, item: &TrackItem) -> bool {
 /// with the layer's effects, faded by its opacity and opacity masks and limited to its
 /// (Motion-transformed) frame, and the blend mode it mixes with.
 fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, opts: RenderOptions, tc: &str, below: &Image) -> (Image, Blend) {
+    let _time = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::Effects);
     let (w, h) = (below.w, below.h);
     let mt = item.effect_time_at(t);
     let mut adj = below.clone();

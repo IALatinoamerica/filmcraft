@@ -346,19 +346,31 @@ impl Frames {
     }
 }
 
+/// Measure only acquisition on a render task's stack. Decode-worker publication is already
+/// included in the caller's DecodeWait, so it must not also enter FrameMapWait.
+fn lock_frames(frames: &Mutex<Frames>) -> std::sync::MutexGuard<'_, Frames> {
+    let _wait = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::FrameMapWait);
+    frames.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn lock_decoder(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    let _wait = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::DecoderQueue);
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Keep eviction centered on the active decode, not a concurrent hit or waiting miss.
 struct OutputPin<'a>(&'a Mutex<Frames>);
 
 impl<'a> OutputPin<'a> {
     fn new(frames: &'a Mutex<Frames>, pts: i64) -> Self {
-        frames.lock().unwrap_or_else(PoisonError::into_inner).output_pin = Some(pts);
+        lock_frames(frames).output_pin = Some(pts);
         Self(frames)
     }
 }
 
 impl Drop for OutputPin<'_> {
     fn drop(&mut self) {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).output_pin = None;
+        lock_frames(self.0).output_pin = None;
     }
 }
 
@@ -704,8 +716,10 @@ fn decode_pool() -> Option<&'static rayon::ThreadPool> {
 /// rayon worker would also run other jobs of its pool while it waits for the decode pool, some
 /// of them asking for a cache's lock while it holds this one: it waits on a plain thread instead.
 fn isolated<T: Send>(f: impl FnOnce() -> crate::Result<T> + Send) -> crate::Result<T> {
+    let render_origin = filmcraft_frame::render_timing::active();
+    let _wait = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::DecodeWait);
     let ctx = filmcraft_media::cancel::Context::current();
-    let job = move || ctx.run(f);
+    let job = move || filmcraft_frame::render_timing::decode_run(render_origin, || ctx.run(f));
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(pool) = decode_pool() {
         if rayon::current_thread_index().is_none() {
@@ -775,7 +789,7 @@ impl GopCache {
     /// Exclude this cache's decoder from the limits and recycling while export work needs it.
     /// A boolean pin: repeated pin or unpin calls are idempotent.
     pub fn set_export_pinned(&self, pinned: bool) {
-        let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut st = lock_decoder(&self.shared.state);
         if st.export_pinned == pinned {
             return;
         }
@@ -787,7 +801,7 @@ impl GopCache {
             }
         }
         st.export_pinned = pinned;
-        self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner).export_position = pinned.then_some(i64::MIN);
+        lock_frames(&self.shared.frames).export_position = pinned.then_some(i64::MIN);
     }
 
     /// Set the scheduler's eviction boundary using the same sample lookup as frame requests,
@@ -795,7 +809,7 @@ impl GopCache {
     pub fn set_export_position(&self, s: &dyn VideoSamples, target: i64) {
         let n = s.count();
         let Some(i) = s.sample_at(target.max(0)).or_else(|| (n > 0).then(|| n - 1)) else { return };
-        let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut frames = lock_frames(&self.shared.frames);
         if frames.export_position.is_some() {
             frames.export_position = Some(s.pts(i));
         }
@@ -857,7 +871,7 @@ impl GopCache {
         }
         let done = Arc::new(self.finish(VideoFrame::clone(&t.frame)));
         let wait = Instant::now();
-        let mut st = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut st = lock_frames(&self.shared.frames);
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         let stored = st.frames.get(&t.pts).is_some_and(|f| Arc::ptr_eq(f, &t.frame));
         if stored {
@@ -941,7 +955,7 @@ impl GopCache {
         count_frames(&out);
         for d in out {
             st.out_max = st.out_max.max(d.pts);
-            let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut frames = lock_frames(&self.shared.frames);
             self.store(&mut frames, d.pts, d.frame, d.draft);
             drop(frames);
             self.shared.pool.trim_frames(&self.shared);
@@ -1013,7 +1027,7 @@ impl GopCache {
         // after the guard on every return path: dropping a decoder can block.
         let mut released: Vec<Box<dyn VideoDecoder>> = Vec::new();
         let wait = Instant::now();
-        let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut st = lock_decoder(&self.shared.state);
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         let _decoding = DecodingGuard::enter(me);
         if let Some(taken) = self.cached(want_pts, draft, background) {
@@ -1021,7 +1035,7 @@ impl GopCache {
         }
         MISSES.fetch_add(1, Ordering::Relaxed);
         {
-            let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut frames = lock_frames(&self.shared.frames);
             frames.pin = want_pts;
             if !background {
                 frames.background = false;
@@ -1058,14 +1072,14 @@ impl GopCache {
         let _pin = OutputPin::new(&self.shared.frames, want_pts);
         let st = &mut *st;
         let taken = isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft))?;
-        self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner).count_used(taken.pts);
+        lock_frames(&self.shared.frames).count_used(taken.pts);
         Ok(taken)
     }
 
     /// Take an exact cache hit without acquiring the decoder lock.
     fn cached(&self, want_pts: i64, draft: bool, background: bool) -> Option<Taken> {
         let wait = Instant::now();
-        let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut frames = lock_frames(&self.shared.frames);
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         frames.last_used = Instant::now();
         frames.pin = want_pts;
@@ -1096,7 +1110,7 @@ impl GopCache {
             let floored = !continuing && allow_floor;
             if !continuing {
                 SEEKS.fetch_add(1, Ordering::Relaxed);
-                let counter = match st.seek_cause(&self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner), i, key, want_pts) {
+                let counter = match st.seek_cause(&lock_frames(&self.shared.frames), i, key, want_pts) {
                     SeekCause::DecoderRecycled => &SEEKS_BY_DECODER_RECYCLED,
                     SeekCause::EvictedFrame => &SEEKS_BY_EVICTED_FRAME,
                     SeekCause::OutOfOrder => &SEEKS_BY_OUT_OF_ORDER,
@@ -1152,11 +1166,11 @@ impl GopCache {
                     st.next += 1;
                     DECODED.fetch_add(1, Ordering::Relaxed);
                     self.store_output(st, out);
-                    if self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner).cached(want_pts, draft).is_some() {
+                    if lock_frames(&self.shared.frames).cached(want_pts, draft).is_some() {
                         break;
                     }
                 }
-                if self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner).cached(want_pts, draft).is_none() {
+                if lock_frames(&self.shared.frames).cached(want_pts, draft).is_none() {
                     let out = st
                         .decoder
                         .as_mut()
@@ -1181,7 +1195,7 @@ impl GopCache {
                 st.next = usize::MAX;
             }
             decoded?;
-            if floored && self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner).cached(want_pts, draft).is_none() {
+            if floored && lock_frames(&self.shared.frames).cached(want_pts, draft).is_none() {
                 // Container and decoder PTS can differ, or the wanted picture can be absent.
                 // Replay once without suppression so at_or_before sees the old path's candidates.
                 allow_floor = false;
@@ -1189,13 +1203,7 @@ impl GopCache {
                 continue;
             }
             // nearest decoded frame at or before the wanted pts (robust to decoder pts quirks)
-            return self
-                .shared
-                .frames
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .at_or_before(want_pts, draft)
-                .ok_or_else(|| CodecError::Decode("frame not produced".into()));
+            return lock_frames(&self.shared.frames).at_or_before(want_pts, draft).ok_or_else(|| CodecError::Decode("frame not produced".into()));
         }
     }
 
@@ -1280,7 +1288,7 @@ impl GopCache {
         });
         let res = res.inspect(|out| count_frames(out));
         let wait = Instant::now();
-        let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut st = lock_decoder(&self.shared.state);
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         if st.spare.len() < 16 {
             st.spare.push(dec);
@@ -1288,12 +1296,12 @@ impl GopCache {
         // cached raw: the request that takes a frame crops and turns it off the lock, or leaves
         // the turn to the GPU (`frame_late_unturned`)
         for d in res? {
-            let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut frames = lock_frames(&self.shared.frames);
             self.store(&mut frames, d.pts, d.frame, d.draft);
             drop(frames);
             self.shared.pool.trim_frames(&self.shared);
         }
-        let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut frames = lock_frames(&self.shared.frames);
         let taken = frames.at_or_before(want_pts, true).ok_or_else(|| CodecError::Decode("frame not produced".into()))?;
         frames.count_used(taken.pts);
         Ok(taken)

@@ -249,6 +249,7 @@ pub fn composite(dst: &mut Image, src: &Image, opacity: f32, mode: Blend) {
 /// the rectangle is visited; its pixels are mixed exactly as [`composite`] mixes them (the dissolve
 /// pattern follows the pixel's place in `dst`). The part of the rectangle outside `dst` is ignored.
 pub fn composite_at(dst: &mut Image, src: &Image, x0: usize, y0: usize, opacity: f32, mode: Blend) {
+    let _time = filmcraft_frame::render_timing::composite();
     let (cw, ch) = (src.w.min(dst.w.saturating_sub(x0)), src.h.min(dst.h.saturating_sub(y0)));
     if cw == 0 || ch == 0 || src.px.len() != src.w * src.h * 4 {
         return;

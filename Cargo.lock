@@ -2200,6 +2200,7 @@ dependencies = [
  "filmcraft-time",
  "rayon",
  "serde",
+ "web-time",
 ]
 
 [[package]]
