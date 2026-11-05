@@ -579,6 +579,9 @@ impl MediaSource for UnsupportedAsSlate {
     fn set_export_pinned(&self, pinned: bool) {
         self.inner.set_export_pinned(pinned);
     }
+    fn set_export_position(&self, time: filmcraft_time::Tick) {
+        self.inner.set_export_position(time);
+    }
     fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
         match self.inner.video_frame(req) {
             Err(MediaError::Unsupported(why)) => {
@@ -896,13 +899,16 @@ mod tests {
 
     #[test]
     fn unsupported_as_slate_prefetch_forwards_and_preserves_frames() {
-        struct Recording(GeneratorSource, Mutex<Vec<FrameRequest>>);
+        struct Recording(GeneratorSource, Mutex<Vec<FrameRequest>>, Mutex<Vec<filmcraft_time::Tick>>);
         impl MediaSource for Recording {
             fn info(&self) -> &MediaInfo {
                 self.0.info()
             }
             fn prefetch(&self, requests: &[FrameRequest]) {
                 self.1.lock().unwrap().extend_from_slice(requests);
+            }
+            fn set_export_position(&self, time: filmcraft_time::Tick) {
+                self.2.lock().unwrap().push(time);
             }
             fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
                 self.0.video_frame(req)
@@ -915,6 +921,7 @@ mod tests {
         let inner = Arc::new(Recording(
             GeneratorSource::new(filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Aurora), 16, 8, rate, rate.tick_of(24)),
             Mutex::new(Vec::new()),
+            Mutex::new(Vec::new()),
         ));
         let pool = MediaPool::default();
         let src = pool.unsupported_as_slate(ItemId(1), "a.mov", inner.clone());
@@ -922,6 +929,8 @@ mod tests {
         let expected: Vec<_> = requests.iter().map(|&req| src.video_frame(req).unwrap()).collect();
         src.prefetch(&requests);
         assert_eq!(*inner.1.lock().unwrap(), requests);
+        src.set_export_position(requests[0].time);
+        assert_eq!(*inner.2.lock().unwrap(), [requests[0].time]);
         for (&req, expected) in requests.iter().zip(expected) {
             let actual = src.video_frame(req).unwrap();
             assert_eq!(actual.pts, expected.pts);

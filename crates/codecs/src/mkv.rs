@@ -646,6 +646,14 @@ impl MediaSource for MkvSource {
         self.video.set_export_pinned(pinned);
     }
 
+    fn set_export_position(&self, time: Tick) {
+        let Some(ti) = self.vtrack else { return };
+        let Some(track) = self.file.tracks.get(ti) else { return };
+        let rate = self.info.video.as_ref().map(|v| v.frame_rate).unwrap_or_default();
+        let target = from_tick(track, rate, time.max(Tick::ZERO), self.snap);
+        self.video.set_export_position(&MkvVideo { src: self, track: ti }, target);
+    }
+
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let ti = self.vtrack.ok_or(MediaError::NoStream("video"))?;
         let t = req.time.max(Tick::ZERO);

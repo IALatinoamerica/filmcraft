@@ -15,6 +15,7 @@ struct Recording {
     inner: SharedSource,
     fetched: Mutex<Vec<FrameRequest>>,
     prefetched: Mutex<Vec<FrameRequest>>,
+    positions: Mutex<Vec<Tick>>,
     pinned: AtomicBool,
     active: AtomicUsize,
     peak: AtomicUsize,
@@ -29,6 +30,7 @@ impl Recording {
             inner,
             fetched: Default::default(),
             prefetched: Default::default(),
+            positions: Default::default(),
             pinned: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -77,6 +79,11 @@ impl MediaSource for Recording {
         }
         self.pinned.store(pinned, Ordering::Relaxed);
         self.inner.set_export_pinned(pinned);
+    }
+    fn set_export_position(&self, time: Tick) {
+        assert!(self.pinned.load(Ordering::Relaxed));
+        self.positions.lock().unwrap().push(time);
+        self.inner.set_export_position(time);
     }
 }
 
@@ -148,6 +155,31 @@ fn new_scheduler(p: &Project, seq: ItemId) -> Scheduler {
     let settings = ExportSettings { gpu_rendering: crate::GpuRendering::Off, ..Default::default() };
     let pipe = Arc::new(Pipeline::new(Arc::new(p.clone()), seq, &settings, false).unwrap());
     Scheduler::new(pipe)
+}
+
+#[test]
+fn scheduler_eviction_position_tracks_needed_requests_while_prefetch_runs_ahead() {
+    let (p, seq, map, recorded) = fixture();
+    let movie = &recorded[0];
+    movie.block.store(true, Ordering::Relaxed);
+    let (send, started) = mpsc::channel();
+    *movie.started.lock().unwrap() = Some(send);
+    let mut scheduler = new_scheduler(&p, seq);
+    advance(&mut scheduler, 0, 24, &map).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    for next in [0, 6, 12, 18] {
+        advance(&mut scheduler, next, 24, &map).unwrap();
+        let source: SharedSource = movie.clone();
+        let expected = (next..24)
+            .flat_map(|f| filmcraft_render::source_frame_requests(&p, seq, FrameRate::FPS_24.tick_of(f), RenderOptions::default(), &map).unwrap())
+            .filter(|(item, _)| map.source(*item).is_some_and(|s| Arc::ptr_eq(&source, &s)))
+            .map(|(_, r)| r.time)
+            .min()
+            .unwrap();
+        assert_eq!(movie.positions.lock().unwrap().last(), Some(&expected), "output frame {next}");
+    }
+    scheduler.stop(true).unwrap();
+    assert!(!movie.pinned.load(Ordering::Relaxed));
 }
 
 #[test]

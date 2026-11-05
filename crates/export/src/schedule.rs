@@ -67,6 +67,14 @@ impl Scheduler {
             }
         }
         self.release_before(next);
+        // Source PTS need not increase with output time (reverse, remap, shared aliases).
+        // Include all still-needed uses, not the newest request decoded ahead of the renderer.
+        for state in &self.sources {
+            let upcoming = work.iter().find(|w| Arc::ptr_eq(&state.source, &w.source)).into_iter().flat_map(|w| &w.requests);
+            if let Some(time) = state.submitted.iter().chain(upcoming).map(|r| r.request.time).min() {
+                state.source.set_export_position(time);
+            }
+        }
         let (bytes, capacity, mut remaining) = self.budget(&work);
         for w in work {
             if self.cancel.load(Ordering::Relaxed) {
@@ -144,6 +152,9 @@ impl Scheduler {
             Some(i) => i,
             None if self.sources.len() < MAX_SOURCES && *remaining >= bytes => {
                 w.source.set_export_pinned(true);
+                if let Some(time) = w.requests.iter().map(|r| r.request.time).min() {
+                    w.source.set_export_position(time);
+                }
                 self.sources.push(ScheduledSource { source: w.source, submitted: Vec::new(), last: next, job: None });
                 self.sources.len().saturating_sub(1)
             }

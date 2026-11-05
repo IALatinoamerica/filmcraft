@@ -898,6 +898,100 @@ fn export_pinned_caches_keep_decoders_outside_both_limits() {
 }
 
 #[test]
+fn scheduled_export_local_eviction_keeps_current_ahead_and_pinned_frames() {
+    let s = samples(200, 250, 0, false);
+    let mut c = GopCache::new(None);
+    c.budget = MIN_FRAMES * 4;
+    c.set_export_pinned(true);
+    c.set_export_position(&s, 30_500); // Same VFR/interval lookup as frame(): PTS 30_000.
+    c.shared.frames.lock().unwrap().pin = 10_000;
+    let _output = OutputPin::new(&c.shared.frames, 20_000);
+    filmcraft_media::cancel::with_export(true, || {
+        let mut frames = c.shared.frames.lock().unwrap();
+        for i in 0..=100 {
+            let d = picture((i * 1000, false));
+            c.store(&mut frames, d.pts, d.frame, d.draft);
+        }
+        assert_eq!(frames.export_position, Some(30_000));
+        assert!(frames.evicted.contains(&0));
+        assert!(frames.evicted.contains(&29_000));
+        for pts in [10_000, 20_000, 30_000, 50_000, 99_000, 100_000] {
+            assert!(frames.frames.contains_key(&pts), "lost protected PTS {pts}");
+        }
+        assert!(frames.bytes > c.budget, "needed frames may exceed the soft cache budget");
+        assert_eq!(frames.bytes, frames.frames.values().map(|f| f.byte_size()).sum::<usize>());
+        assert_eq!(frames.bytes, c.shared.pool.bytes.load(Ordering::Relaxed));
+    });
+    // Only an explicit scheduler advance moves the boundary; decode-ahead/hits do not.
+    assert_eq!(index_of(&c.frame(&s, 99_000).unwrap()), 99);
+    assert_eq!(c.shared.frames.lock().unwrap().export_position, Some(30_000));
+    c.set_export_position(&s, 80_000);
+    let mut frames = c.shared.frames.lock().unwrap();
+    let d = picture((100_000, false));
+    c.store(&mut frames, d.pts, d.frame, false);
+    assert!(frames.evicted.contains(&30_000));
+    assert!(frames.frames.contains_key(&20_000), "active decode pin survives advance");
+    assert!((80..=100).all(|i| frames.frames.contains_key(&(i * 1000))));
+}
+
+#[test]
+fn scheduled_export_global_eviction_keeps_current_ahead_and_pins() {
+    let pool = Arc::new(Pool::new(0, Duration::ZERO, 0));
+    let c = GopCache::in_pool(None, pool.clone());
+    let other = GopCache::in_pool(None, pool.clone());
+    let s = samples(20, 20, 0, false);
+    c.set_export_pinned(true);
+    c.set_export_position(&s, 5_000);
+    c.frame(&s, 10_000).unwrap();
+    c.frame(&s, 1_000).unwrap();
+    let output = OutputPin::new(&c.shared.frames, 2_000);
+    pool.trim_frames(&other.shared);
+    {
+        let frames = c.shared.frames.lock().unwrap();
+        assert_eq!(frames.frames.keys().copied().collect::<Vec<_>>(), [1_000, 2_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000]);
+        assert_eq!(frames.bytes, 32);
+        assert_eq!(pool.bytes.load(Ordering::Relaxed), 32);
+    }
+    pool.release_idle();
+    assert!(c.shared.state.lock().unwrap().decoder.is_some(), "Stage 7 decoder pin survives trimming");
+    assert_eq!(c.shared.frames.lock().unwrap().frames.len(), 8);
+    drop(output);
+    c.set_export_pinned(false);
+    pool.trim_frames(&other.shared);
+    assert!(c.shared.frames.lock().unwrap().frames.is_empty());
+    pool.release_idle();
+    assert!(c.shared.state.lock().unwrap().decoder.is_none());
+    assert_eq!(pool.bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn unscheduled_export_and_unpinned_cache_keep_normal_eviction() {
+    for pinned in [false, true] {
+        let mut c = GopCache::new(None);
+        c.budget = MIN_FRAMES * 4;
+        if pinned {
+            c.set_export_pinned(true);
+            c.set_export_position(&samples(200, 250, 0, false), 30_000);
+            c.set_export_pinned(false);
+        }
+        filmcraft_media::cancel::with_export(true, || {
+            let mut frames = c.shared.frames.lock().unwrap();
+            frames.pin = 0;
+            for i in 0..=100 {
+                let d = picture((i * 1000, false));
+                c.store(&mut frames, d.pts, d.frame, false);
+            }
+            let d = picture((0, false));
+            c.store(&mut frames, d.pts, d.frame, false);
+            assert_eq!(frames.export_position, None);
+            assert_eq!(frames.bytes, c.budget);
+            assert!(frames.frames.contains_key(&0));
+            assert!(frames.evicted.contains(&99_000), "normal window eviction may discard frames ahead");
+        });
+    }
+}
+
+#[test]
 fn export_unpin_is_idempotent_and_makes_decoder_trimmable() {
     let pool = Arc::new(Pool::new(1, Duration::ZERO, FRAME_BUDGET));
     let s: Vec<Samples> = (0..3).map(|_| samples(300, 250, 3, false)).collect();

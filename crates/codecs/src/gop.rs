@@ -257,6 +257,9 @@ struct Frames {
     pin: i64,
     /// A serialized decode keeps its target protected even when cache hits move `pin`.
     output_pin: Option<i64>,
+    /// Scheduler's earliest still-needed source PTS. Set only while export-pinned; request
+    /// hits and decode-ahead must never advance it. MIN protects everything before the first hint.
+    export_position: Option<i64>,
     /// Only background requests (thumbnails, [`filmcraft_media::cancel::with_background`]) have
     /// used the decoder since it was made: it is given up as soon as another background request
     /// is done, whatever the caches' recency.
@@ -301,7 +304,12 @@ impl Frames {
     /// Evict frames, earliest first, while `more` says so.
     fn release_frames(&mut self, pool: &Pool, more: impl Fn() -> bool) {
         while more() {
-            let Some((pts, f)) = self.frames.pop_first() else { break };
+            let next = match self.export_position {
+                Some(position) => self.frames.range(..position).find(|&(&pts, _)| self.export_evictable(pts, position)),
+                None => self.frames.first_key_value(),
+            };
+            let Some((&pts, _)) = next else { break };
+            let Some(f) = self.frames.remove(&pts) else { break };
             self.drafts.remove(&pts);
             self.raw.remove(&pts);
             self.used.remove(&pts);
@@ -311,6 +319,10 @@ impl Frames {
             EVICTED.fetch_add(1, Ordering::Relaxed);
             filmcraft_frame::pool::recycle(f);
         }
+    }
+
+    fn export_evictable(&self, pts: i64, position: i64) -> bool {
+        pts < position && pts != self.pin && Some(pts) != self.output_pin
     }
 
     /// The cached frame at `pts`, unless it is a draft frame and the request wants the exact one.
@@ -660,9 +672,9 @@ pub struct GopCache {
 /// The cache reserves room for this many small frames: a frame-threaded decoder runs up to ~2x
 /// its thread count ahead of the frame it returns, and playback prefetches ahead of the playhead.
 const MIN_FRAMES: usize = 64;
-/// A source cache never retains more decoded pixels than this, regardless of frame dimensions.
-/// In particular, untrusted VP9 `show_existing_frame` samples must not turn the small-frame
-/// reserve above into an unbounded number of full-resolution copies.
+/// Ordinary per-source ceiling, regardless of frame dimensions. In particular, untrusted VP9
+/// `show_existing_frame` samples must not enlarge the small-frame reserve above. Scheduled exports
+/// may exceed this soft budget to retain frames at/ahead of their explicit eviction boundary.
 const FRAME_CACHE_CEILING: usize = 384 << 20;
 
 /// A running decoder up to this many samples before the wanted sample's sync sample keeps going
@@ -751,6 +763,7 @@ impl GopCache {
                 last_used: Instant::now(),
                 pin: i64::MIN,
                 output_pin: None,
+                export_position: None,
                 background: false,
             }),
             pool: pool.clone(),
@@ -774,6 +787,18 @@ impl GopCache {
             }
         }
         st.export_pinned = pinned;
+        self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner).export_position = pinned.then_some(i64::MIN);
+    }
+
+    /// Set the scheduler's eviction boundary using the same sample lookup as frame requests,
+    /// so a VFR frame spanning `target` is retained. This takes only the frame-map lock.
+    pub fn set_export_position(&self, s: &dyn VideoSamples, target: i64) {
+        let n = s.count();
+        let Some(i) = s.sample_at(target.max(0)).or_else(|| (n > 0).then(|| n - 1)) else { return };
+        let mut frames = self.shared.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        if frames.export_position.is_some() {
+            frames.export_position = Some(s.pts(i));
+        }
     }
 
     /// Turn every decoded frame clockwise by `quarter_turns` × 90° (the container's display
@@ -878,7 +903,14 @@ impl GopCache {
         let pivot = st.output_pin.unwrap_or(if st.pin != i64::MIN { st.pin } else { pts });
         while st.bytes > budget && st.frames.len() > 2 {
             let (Some(&first), Some(&last)) = (st.frames.keys().next(), st.frames.keys().next_back()) else { break };
-            let mut victim = if pivot - first > last - pivot { first } else { last };
+            let mut victim = if let Some(position) = st.export_position {
+                let Some((&victim, _)) = st.frames.range(..position).find(|&(&p, _)| st.export_evictable(p, position) && p != pts) else { break };
+                victim
+            } else if pivot - first > last - pivot {
+                first
+            } else {
+                last
+            };
             if victim == pivot || victim == pts {
                 victim = if victim == first { last } else { first };
                 if victim == pivot || victim == pts {

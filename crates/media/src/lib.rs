@@ -222,6 +222,9 @@ pub trait MediaSource: Send + Sync {
     /// While pinned (an export has scheduled work on this source), its decoder is not counted
     /// toward the live-decoder limits and is not recycled. Default: no-op.
     fn set_export_pinned(&self, _pinned: bool) {}
+    /// Earliest source time still needed in the current export window, including outstanding
+    /// prefetches. Pinned sources may evict only frames before it. Default: no-op.
+    fn set_export_position(&self, _time: Tick) {}
     /// Like [`video_frame`](Self::video_frame), but a source may leave the container's display
     /// rotation to the caller: the frame comes with the clockwise quarter turns still to apply
     /// to it (0: upright, as `video_frame` returns it).

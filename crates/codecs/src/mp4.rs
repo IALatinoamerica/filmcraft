@@ -515,6 +515,14 @@ impl MediaSource for Mp4Source {
         self.video.set_export_pinned(pinned);
     }
 
+    fn set_export_position(&self, time: Tick) {
+        let Some(ti) = self.vtrack else { return };
+        let Some(track) = self.file.tracks.get(ti) else { return };
+        let rate = self.info.video.as_ref().map(|v| v.frame_rate).unwrap_or_default();
+        let target = crate::gop::lookup_time(time.max(Tick::ZERO), 1, i64::from(track.timescale), rate, self.snap);
+        self.video.set_export_position(&Mp4Video { src: self, track: ti }, target);
+    }
+
     /// The frame as decoded, with the display matrix's rotation left to the caller (#3467). The
     /// time lookup is `video_at`'s.
     fn video_frame_unturned(&self, req: FrameRequest) -> Result<(Arc<VideoFrame>, u8), MediaError> {
