@@ -114,6 +114,204 @@ fn samples(n: usize, gop: usize, delay: usize, intra: bool) -> Samples {
     Samples { n, gop, delay, intra, resets: Default::default(), decodes: Default::default() }
 }
 
+/// A readback front around the existing mock decoders, with the same output suppression as
+/// hardware. Keep a per-run count as well as the real process-wide counter: other tests run
+/// concurrently and can increment the latter.
+struct FloorSamples<S> {
+    samples: S,
+    floors: Arc<Mutex<Vec<Option<i64>>>>,
+    readbacks: Arc<AtomicUsize>,
+    pts_shift: i64,
+    omit: Option<i64>,
+    fail: Option<i64>,
+}
+
+impl<S> FloorSamples<S> {
+    fn new(samples: S) -> Self {
+        Self { samples, floors: Default::default(), readbacks: Default::default(), pts_shift: 0, omit: None, fail: None }
+    }
+}
+
+struct FloorDec {
+    inner: Box<dyn VideoDecoder>,
+    floor: Option<i64>,
+    floors: Arc<Mutex<Vec<Option<i64>>>>,
+    readbacks: Arc<AtomicUsize>,
+    pts_shift: i64,
+    omit: Option<i64>,
+    fail: Option<i64>,
+}
+
+impl FloorDec {
+    fn read_out(&self, out: Vec<DecodedFrame>) -> Vec<DecodedFrame> {
+        out.into_iter()
+            .filter_map(|mut p| {
+                if self.omit == Some(p.pts) {
+                    return None;
+                }
+                p.pts += self.pts_shift;
+                if self.floor.is_some_and(|floor| p.pts < floor) {
+                    return None;
+                }
+                self.readbacks.fetch_add(1, Ordering::Relaxed);
+                crate::hw::note_hw_readback();
+                Some(p)
+            })
+            .collect()
+    }
+}
+
+impl VideoDecoder for FloorDec {
+    fn decode(&mut self, sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+        if self.fail == Some(pts) {
+            return Err(CodecError::Decode("mock decode error".into()));
+        }
+        let out = self.inner.decode(sample, pts)?;
+        Ok(self.read_out(out))
+    }
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        assert_eq!(self.floor, None, "clear before flushing");
+        let out = self.inner.flush();
+        self.read_out(out)
+    }
+    fn reset(&mut self) {
+        assert_eq!(self.floor, None, "clear before resetting");
+        self.inner.reset();
+    }
+    fn set_output_floor(&mut self, pts: Option<i64>) {
+        self.floor = pts;
+        self.floors.lock().unwrap().push(pts);
+    }
+    fn name(&self) -> &str {
+        "floor readback mock"
+    }
+}
+
+impl<S: VideoSamples> VideoSamples for FloorSamples<S> {
+    fn count(&self) -> usize {
+        self.samples.count()
+    }
+    fn pts(&self, i: usize) -> i64 {
+        self.samples.pts(i)
+    }
+    fn sync_before(&self, i: usize) -> usize {
+        self.samples.sync_before(i)
+    }
+    fn sample_at(&self, t: i64) -> Option<usize> {
+        self.samples.sample_at(t)
+    }
+    fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+        self.samples.read(i)
+    }
+    fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+        Ok(Box::new(FloorDec {
+            inner: self.samples.make_decoder()?,
+            floor: None,
+            floors: self.floors.clone(),
+            readbacks: self.readbacks.clone(),
+            pts_shift: self.pts_shift,
+            omit: self.omit,
+            fail: self.fail,
+        }))
+    }
+}
+
+fn frame_bytes(f: &VideoFrame) -> Vec<u8> {
+    match &f.data {
+        filmcraft_frame::PixelData::Rgba8(bytes) => bytes.to_vec(),
+        _ => panic!("expected RGBA8 mock frame"),
+    }
+}
+
+#[test]
+fn export_floor_skips_readbacks_and_preserves_frames() {
+    for delay in [0, 24] {
+        let run = |export| {
+            let s = FloorSamples::new(samples(300, 250, delay, false));
+            let c = GopCache::new(None);
+            let before = crate::hw::hw_stats().readbacks;
+            let frames = filmcraft_media::cancel::with_export(export, || {
+                // An in-between time resolves to a real sample PTS; include continuation,
+                // backward seeking, delayed output at EOF, and a request past EOF.
+                [80_500, 81_500, 40_500, 299_500, 400_000].map(|t| frame_bytes(&c.frame(&s, t).expect("frame")))
+            });
+            let readbacks = s.readbacks.load(Ordering::Relaxed);
+            assert!(crate::hw::hw_stats().readbacks - before >= readbacks as u64);
+            let floors = s.floors.lock().unwrap().clone();
+            assert_eq!(floors.last(), Some(&None), "clear when the request ends");
+            (frames, readbacks, floors)
+        };
+        let (plain, plain_readbacks, plain_floors) = run(false);
+        let (export, export_readbacks, export_floors) = run(true);
+        assert_eq!(export, plain);
+        assert!(plain_floors.iter().all(Option::is_none));
+        assert!(export_floors.contains(&Some(80_000)));
+        assert!(export_floors.contains(&Some(40_000)));
+        assert!(!export_floors.contains(&Some(81_000)), "continuation does not set a new floor");
+        assert!(export_readbacks < plain_readbacks, "{export_readbacks} < {plain_readbacks}");
+    }
+}
+
+#[test]
+fn export_floor_replays_without_suppression_for_pts_quirks_and_missing_frames() {
+    for (shift, omit, want, expected) in [(-1, None, 5_500, 5), (0, Some(5_000), 5_500, 4), (0, Some(9_000), 9_500, 8)] {
+        let run = |export| {
+            let mut s = FloorSamples::new(samples(10, 10, 0, false));
+            s.pts_shift = shift;
+            s.omit = omit;
+            let c = GopCache::new(None);
+            let frame = filmcraft_media::cancel::with_export(export, || c.frame(&s, want)).expect("fallback frame");
+            assert_eq!(index_of(&frame), expected);
+            if export {
+                assert_eq!(s.samples.resets.load(Ordering::Relaxed), 2, "one bounded retry without a floor");
+                assert_eq!(s.floors.lock().unwrap().iter().filter(|p| p.is_some()).count(), 1);
+            }
+            frame_bytes(&frame)
+        };
+        assert_eq!(run(true), run(false));
+    }
+}
+
+#[test]
+fn export_floor_preserves_reordered_open_gop_leading_pictures() {
+    let run = |export| {
+        let s = FloorSamples::new(OpenGop::new(6));
+        let c = GopCache::new(None);
+        let frames = filmcraft_media::cancel::with_export(export, || {
+            [6_500, 7_000, 16_000, 15_000, 14_000, 39_000].map(|t| frame_bytes(&c.frame(&s, t).expect("leading frame")))
+        });
+        if export {
+            assert!(s.floors.lock().unwrap().contains(&Some(6_000)));
+        }
+        frames
+    };
+    assert_eq!(run(true), run(false));
+}
+
+#[test]
+fn export_floor_is_cleared_before_playback_continues() {
+    let s = FloorSamples::new(samples(100, 100, 8, false));
+    let c = GopCache::new(None);
+    filmcraft_media::cancel::with_export(true, || c.frame(&s, 50_000)).expect("export frame");
+    assert_eq!(s.floors.lock().unwrap().last(), Some(&None));
+    for i in [51, 20, 21] {
+        assert_eq!(index_of(&c.frame(&s, i * 1000).expect("playback frame")), i as usize);
+    }
+}
+
+#[test]
+fn export_floor_is_cleared_after_decode_errors() {
+    let mut s = FloorSamples::new(samples(100, 100, 0, false));
+    s.fail = Some(10_000);
+    let c = GopCache::new(None);
+    assert!(filmcraft_media::cancel::with_export(true, || c.frame(&s, 50_000)).is_err());
+    assert_eq!(s.floors.lock().unwrap().last(), Some(&None));
+    assert_eq!(c.shared.state.lock().unwrap().next, usize::MAX);
+    // Frame 5 was suppressed before the error; playback must restart to recover it.
+    assert_eq!(index_of(&c.frame(&s, 5_000).expect("playback after error")), 5);
+    assert_eq!(s.samples.resets.load(Ordering::Relaxed), 2);
+}
+
 #[test]
 fn seek_causes_follow_cache_history_and_precedence() {
     let s = samples(900, 30, 0, false);

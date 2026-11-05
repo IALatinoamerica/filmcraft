@@ -120,7 +120,7 @@ fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider,
     let frames: Vec<Frame> = (f..end)
         .into_par_iter()
         .map(|fi| {
-            let frame = pipe.frame(fi, sources);
+            let frame = filmcraft_media::cancel::with_export(true, || pipe.frame(fi, sources));
             if filmcraft_media::pending::take() {
                 pending.store(true, Ordering::Relaxed);
             }
@@ -582,7 +582,9 @@ impl Exporter {
         let mut encode_done: Option<web_time::Instant> = None;
         let encoded = rayon::in_place_scope(|s| {
             s.spawn(|_| {
-                slot = Some(catch_unwind(AssertUnwindSafe(|| timed(Stage::Render, || render_batch(&pipe, a, b, sources, prepare.as_ref(), f0)))));
+                slot = Some(catch_unwind(AssertUnwindSafe(|| {
+                    filmcraft_media::cancel::with_export(true, || timed(Stage::Render, || render_batch(&pipe, a, b, sources, prepare.as_ref(), f0)))
+                })));
             });
             let r = self.encode_batch(f, frames, sources);
             encode_done = Some(web_time::Instant::now());

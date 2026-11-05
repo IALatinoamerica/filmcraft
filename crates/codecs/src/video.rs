@@ -45,6 +45,11 @@ pub trait VideoDecoder: Send {
     /// shortcuts that only change pictures nothing references, which come out flagged
     /// [`DecodedFrame::draft`]. Decoders without such a mode ignore it.
     fn set_draft(&mut self, _on: bool) {}
+    /// Pictures below this PTS are decoded and kept as references, but not returned.
+    /// `None` clears the floor.
+    fn set_output_floor(&mut self, pts: Option<i64>) {
+        let _ = pts;
+    }
     /// Made with fewer worker threads than a decoder for playback gets, because it was made for
     /// background work ([`filmcraft_media::cancel::with_background`]). A request for a monitor
     /// replaces such a decoder.

@@ -202,6 +202,13 @@ mod linux {
             }
         }
 
+        fn set_output_floor(&mut self, pts: Option<i64>) {
+            match &mut self.front {
+                Front::H264(f) => f.set_output_floor(pts),
+                Front::Hevc(f) => f.set_output_floor(pts),
+            }
+        }
+
         fn name(&self) -> &str {
             &self.name
         }

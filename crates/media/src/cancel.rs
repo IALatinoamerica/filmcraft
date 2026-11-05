@@ -29,6 +29,7 @@ thread_local! {
     static CATCH_UP: Cell<Option<Tick>> = const { Cell::new(None) };
     static DRAFT: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    static EXPORT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` as background work when `on` (restoring the previous hint after): a thumbnail, not a
@@ -50,6 +51,24 @@ pub fn with_background<R>(on: bool, f: impl FnOnce() -> R) -> R {
 /// [`with_background`]`(true, …)`).
 pub fn background() -> bool {
     BACKGROUND.with(Cell::get)
+}
+
+/// Run `f` as export work when `on`, restoring the previous hint afterwards.
+pub fn with_export<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXPORT.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(EXPORT.with(|c| c.replace(on)));
+    f()
+}
+
+/// Whether the work running on this thread is export work (off unless inside
+/// [`with_export`]`(true, …)`).
+pub fn export() -> bool {
+    EXPORT.with(Cell::get)
 }
 
 /// Run `f` with the draft-decoding hint `on` (restoring the previous one after). Frames decoded
@@ -97,19 +116,20 @@ pub fn cancelled() -> bool {
 }
 
 /// The hints of the work running on this thread ([`with_cancel`], [`with_catch_up`],
-/// [`with_draft`], [`with_background`]), to carry them to another thread doing part of that work.
+/// [`with_draft`], [`with_background`], [`with_export`]), to carry them to another thread doing part of that work.
 #[derive(Clone, Default)]
 pub struct Context {
     cancel: Option<Arc<AtomicBool>>,
     catch_up: Option<Tick>,
     draft: bool,
     background: bool,
+    export: bool,
 }
 
 impl Context {
     /// This thread's hints.
     pub fn current() -> Self {
-        Context { cancel: CURRENT.with(|c| c.borrow().clone()), catch_up: catch_up(), draft: draft(), background: background() }
+        Context { cancel: CURRENT.with(|c| c.borrow().clone()), catch_up: catch_up(), draft: draft(), background: background(), export: export() }
     }
 
     /// Run `f` with these hints, restoring this thread's however `f` ends (a pool thread must
@@ -123,6 +143,7 @@ impl Context {
                 CATCH_UP.with(|c| c.set(prev.catch_up));
                 DRAFT.with(|c| c.set(prev.draft));
                 BACKGROUND.with(|c| c.set(prev.background));
+                EXPORT.with(|c| c.set(prev.export));
             }
         }
         let _restore = Restore(Context::current());
@@ -130,6 +151,7 @@ impl Context {
         CATCH_UP.with(|c| c.set(self.catch_up));
         DRAFT.with(|c| c.set(self.draft));
         BACKGROUND.with(|c| c.set(self.background));
+        EXPORT.with(|c| c.set(self.export));
         f()
     }
 }
@@ -141,15 +163,15 @@ mod tests {
     #[test]
     fn context_carries_the_hints_to_another_thread_and_restores_its_own() {
         let flag = Arc::new(AtomicBool::new(true));
-        let ctx = with_cancel(&flag, || with_draft(true, || with_background(true, || with_catch_up(Some(Tick(5)), Context::current))));
+        let ctx = with_cancel(&flag, || with_draft(true, || with_background(true, || with_export(true, || with_catch_up(Some(Tick(5)), Context::current)))));
         std::thread::scope(|s| {
             s.spawn(|| {
-                let seen = with_draft(false, || ctx.clone().run(|| (cancelled(), draft(), background(), catch_up())));
-                assert_eq!(seen, (true, true, true, Some(Tick(5))));
+                let seen = with_draft(false, || ctx.clone().run(|| (cancelled(), draft(), background(), export(), catch_up())));
+                assert_eq!(seen, (true, true, true, true, Some(Tick(5))));
                 // a panic inside leaves this thread's own hints in place
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.clone().run(|| panic!("job"))));
                 assert!(r.is_err());
-                assert_eq!((cancelled(), draft(), background(), catch_up()), (false, false, false, None));
+                assert_eq!((cancelled(), draft(), background(), export(), catch_up()), (false, false, false, false, None));
             });
         });
     }
@@ -193,6 +215,24 @@ mod tests {
         let r = std::panic::catch_unwind(|| with_background(true, || panic!("boom")));
         assert!(r.is_err());
         assert!(!background());
+    }
+
+    #[test]
+    fn export_is_off_by_default_and_scoped() {
+        assert!(!export());
+        with_export(true, || {
+            assert!(export());
+            with_export(false, || assert!(!export()));
+            assert!(export());
+        });
+        assert!(!export());
+    }
+
+    #[test]
+    fn a_panic_inside_export_work_does_not_leave_the_thread_marked() {
+        let r = std::panic::catch_unwind(|| with_export(true, || panic!("boom")));
+        assert!(r.is_err());
+        assert!(!export());
     }
 
     #[test]

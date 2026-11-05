@@ -256,6 +256,14 @@ impl VideoDecoder for HybridDecoder {
         self.info.is_disposable(sample)
     }
 
+    fn set_output_floor(&mut self, pts: Option<i64>) {
+        if let Some(hw) = self.hw.as_mut() {
+            hw.set_output_floor(pts);
+        } else if let Some(sw) = self.sw.as_mut() {
+            sw.set_output_floor(pts);
+        }
+    }
+
     fn set_draft(&mut self, on: bool) {
         self.draft = on;
         if let Some(sw) = self.sw.as_mut() {

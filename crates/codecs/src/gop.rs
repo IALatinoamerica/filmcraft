@@ -947,81 +947,117 @@ impl GopCache {
     /// Decode (the lock held) until the frame with `want_pts` (sample `i`) is cached; return it.
     fn decode_until(&self, st: &mut State, s: &dyn VideoSamples, i: usize, want_pts: i64, late_before: Option<i64>, draft: bool) -> crate::Result<Taken> {
         let n = s.count();
-        let mut key = decode_start(s, i);
-        // Continue the running decoder when it has passed the wanted sample's sync sample and
-        // either has not reached the sample yet or has been fed it without outputting it yet
-        // (a frame-threaded decoder holds many pictures in flight). Otherwise the frame was
-        // evicted or lies in another GOP: restart at the sync sample. A run that started after
-        // `key` (at the random-access picture of a wanted leading picture) left the picture out.
-        let running = st.next != usize::MAX && st.next <= n && st.start <= key;
-        // Decoding on through a short stretch into the next GOP is cheaper than a restart, and
-        // playback wants those frames anyway.
-        let near = st.next <= key && key - st.next <= CONTINUE_THROUGH;
-        let continuing = running && (st.next > key || near) && (i >= st.next || (st.start <= i && want_pts > st.out_max));
-        if !continuing {
-            SEEKS.fetch_add(1, Ordering::Relaxed);
-            let counter = match st.seek_cause(i, key, want_pts) {
-                SeekCause::DecoderRecycled => &SEEKS_BY_DECODER_RECYCLED,
-                SeekCause::EvictedFrame => &SEEKS_BY_EVICTED_FRAME,
-                SeekCause::OutOfOrder => &SEEKS_BY_OUT_OF_ORDER,
-                SeekCause::CutIn => &SEEKS_BY_CUT_IN,
-                SeekCause::Other => &SEEKS_BY_OTHER,
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            st.had_decoder = true;
-            st.fresh_decoder = false;
-            // The container's sync flags may be wrong for the codec (an MP4 without `stss` marks
-            // every sample): step back to a sample the decoder can start from.
-            while key > 0 {
-                let data = s.read(key)?;
-                if st.decoder.as_ref().and_then(|d| d.is_random_access(&data)) != Some(false) {
-                    break;
+        let mut allow_floor = filmcraft_media::cancel::export();
+        loop {
+            let mut key = decode_start(s, i);
+            // Continue the running decoder when it has passed the wanted sample's sync sample and
+            // either has not reached the sample yet or has been fed it without outputting it yet
+            // (a frame-threaded decoder holds many pictures in flight). Otherwise the frame was
+            // evicted or lies in another GOP: restart at the sync sample. A run that started after
+            // `key` (at the random-access picture of a wanted leading picture) left the picture out.
+            let running = st.next != usize::MAX && st.next <= n && st.start <= key;
+            // Decoding on through a short stretch into the next GOP is cheaper than a restart, and
+            // playback wants those frames anyway.
+            let near = st.next <= key && key - st.next <= CONTINUE_THROUGH;
+            let continuing = running && (st.next > key || near) && (i >= st.next || (st.start <= i && want_pts > st.out_max));
+            let floored = !continuing && allow_floor;
+            if !continuing {
+                SEEKS.fetch_add(1, Ordering::Relaxed);
+                let counter = match st.seek_cause(i, key, want_pts) {
+                    SeekCause::DecoderRecycled => &SEEKS_BY_DECODER_RECYCLED,
+                    SeekCause::EvictedFrame => &SEEKS_BY_EVICTED_FRAME,
+                    SeekCause::OutOfOrder => &SEEKS_BY_OUT_OF_ORDER,
+                    SeekCause::CutIn => &SEEKS_BY_CUT_IN,
+                    SeekCause::Other => &SEEKS_BY_OTHER,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                st.had_decoder = true;
+                st.fresh_decoder = false;
+                // The container's sync flags may be wrong for the codec (an MP4 without `stss` marks
+                // every sample): step back to a sample the decoder can start from.
+                while key > 0 {
+                    let data = s.read(key)?;
+                    if st.decoder.as_ref().and_then(|d| d.is_random_access(&data)) != Some(false) {
+                        break;
+                    }
+                    key = s.sync_before(key - 1);
                 }
-                key = s.sync_before(key - 1);
+                if let Some(d) = st.decoder.as_mut() {
+                    d.set_output_floor(None);
+                    d.reset();
+                    if floored {
+                        d.set_output_floor(Some(want_pts));
+                    }
+                }
+                st.next = key;
+                st.start = key;
+                st.out_max = i64::MIN;
             }
+            let decoded: crate::Result<()> = (|| {
+                let limit = (i.max(st.next) + 64).min(n);
+                let late = late_before.unwrap_or(i64::MIN).min(want_pts);
+                let Some(decoder) = st.decoder.as_mut() else {
+                    return Err(CodecError::Decode("no video decoder".into()));
+                };
+                decoder.set_draft(draft);
+                while st.next < limit {
+                    if filmcraft_media::cancel::cancelled() {
+                        // A run without suppression can continue on a later request.
+                        return Err(CodecError::Cancelled);
+                    }
+                    let k = st.next;
+                    let data = s.read(k)?;
+                    if k != i && s.pts(k) < late && st.decoder.as_ref().is_some_and(|d| d.is_disposable(&data)) {
+                        st.next += 1;
+                        SKIPPED.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let Some(decoder) = st.decoder.as_mut() else {
+                        return Err(CodecError::Decode("no video decoder".into()));
+                    };
+                    let out = timed(|| decoder.decode(&data, s.pts(k)))?;
+                    st.next += 1;
+                    DECODED.fetch_add(1, Ordering::Relaxed);
+                    self.store_output(st, out);
+                    if st.cached(want_pts, draft).is_some() {
+                        break;
+                    }
+                }
+                if st.cached(want_pts, draft).is_none() {
+                    let out = st
+                        .decoder
+                        .as_mut()
+                        .map(|d| {
+                            d.set_output_floor(None);
+                            timed(|| d.flush())
+                        })
+                        .unwrap_or_default();
+                    self.store_output(st, out);
+                    st.next = usize::MAX;
+                }
+                Ok(())
+            })();
+            // Also clear on cancellation, sample-read failure and decode errors. A later
+            // request may continue this decoder outside export.
             if let Some(d) = st.decoder.as_mut() {
-                d.reset();
+                d.set_output_floor(None);
             }
-            st.next = key;
-            st.start = key;
-            st.out_max = i64::MIN;
-        }
-        let limit = (i.max(st.next) + 64).min(n);
-        let late = late_before.unwrap_or(i64::MIN).min(want_pts);
-        let Some(decoder) = st.decoder.as_mut() else {
-            return Err(CodecError::Decode("no video decoder".into()));
-        };
-        decoder.set_draft(draft);
-        while st.next < limit {
-            if filmcraft_media::cancel::cancelled() {
-                // The decoder state stays consistent (`next`, `out_max`): a later request continues.
-                return Err(CodecError::Cancelled);
+            if floored && decoded.is_err() {
+                // Earlier pictures may have been suppressed before an interrupted cut-in.
+                // A later request for one must restart, rather than continue past it.
+                st.next = usize::MAX;
             }
-            let k = st.next;
-            let data = s.read(k)?;
-            if k != i && s.pts(k) < late && st.decoder.as_ref().is_some_and(|d| d.is_disposable(&data)) {
-                st.next += 1;
-                SKIPPED.fetch_add(1, Ordering::Relaxed);
+            decoded?;
+            if floored && st.cached(want_pts, draft).is_none() {
+                // Container and decoder PTS can differ, or the wanted picture can be absent.
+                // Replay once without suppression so at_or_before sees the old path's candidates.
+                allow_floor = false;
+                st.next = usize::MAX;
                 continue;
             }
-            let Some(decoder) = st.decoder.as_mut() else {
-                return Err(CodecError::Decode("no video decoder".into()));
-            };
-            let out = timed(|| decoder.decode(&data, s.pts(k)))?;
-            st.next += 1;
-            DECODED.fetch_add(1, Ordering::Relaxed);
-            self.store_output(st, out);
-            if st.cached(want_pts, draft).is_some() {
-                break;
-            }
+            // nearest decoded frame at or before the wanted pts (robust to decoder pts quirks)
+            return st.at_or_before(want_pts, draft).ok_or_else(|| CodecError::Decode("frame not produced".into()));
         }
-        if st.cached(want_pts, draft).is_none() {
-            let out = st.decoder.as_mut().map(|d| timed(|| d.flush())).unwrap_or_default();
-            self.store_output(st, out);
-            st.next = usize::MAX;
-        }
-        // nearest decoded frame at or before the wanted pts (robust to decoder pts quirks)
-        st.at_or_before(want_pts, draft).ok_or_else(|| CodecError::Decode("frame not produced".into()))
     }
 
     /// A nested request (see [`Self::frame`]): decode from the sync sample with a fresh decoder,

@@ -57,6 +57,7 @@ struct Pending {
 pub struct Front<A: Accel> {
     accel: A,
     length_size: usize,
+    output_floor: Option<i64>,
     /// Coded size (luma samples) and bit depth the surfaces were made for.
     size: (u32, u32),
     bits: u32,
@@ -87,6 +88,7 @@ impl<A: Accel> Front<A> {
         let mut f = Self {
             accel,
             length_size,
+            output_floor: None,
             size,
             bits,
             spss: vec![None; 16],
@@ -108,6 +110,10 @@ impl<A: Accel> Front<A> {
 
     pub fn accel(&self) -> &A {
         &self.accel
+    }
+
+    pub fn set_output_floor(&mut self, pts: Option<i64>) {
+        self.output_floor = pts;
     }
 
     /// Decode one access unit; pictures that left the DPB come back in output order.
@@ -147,6 +153,9 @@ impl<A: Accel> Front<A> {
     /// Read back the pictures the DPB output, right away: a surface leaving the DPB is reused.
     fn read_out(&mut self, outs: Vec<Output<Surface>>, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         for o in outs {
+            if self.output_floor.is_some_and(|floor| o.meta.pts < floor) {
+                continue;
+            }
             let frame = self.accel.read(o.frame.index).map_err(decode_err)?;
             frames.push(DecodedFrame { pts: o.meta.pts, frame, draft: false });
         }
