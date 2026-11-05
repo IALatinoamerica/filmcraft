@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 use std::time::Duration;
 
 use web_time::Instant;
@@ -236,7 +236,41 @@ struct State {
     out_max: i64,
 }
 
+/// A decode invocation, including an elected owner still acquiring the decoder lock.
+struct DecodeRun {
+    generation: u64,
+    first_pts: i64,
+    target_pts: i64,
+    draft: bool,
+    waiters: usize,
+    outcome: Option<RunOutcome>,
+}
+
+enum RunOutcome {
+    Produced,
+    EndedWithoutFrame,
+    Error(Arc<CodecError>),
+    Cancelled,
+}
+
+impl RunOutcome {
+    fn error(&self) -> Option<CodecError> {
+        match self {
+            Self::Produced | Self::EndedWithoutFrame => None,
+            Self::Cancelled => Some(CodecError::Cancelled),
+            Self::Error(error) => Some(match error.as_ref() {
+                CodecError::Decode(s) => CodecError::Decode(s.clone()),
+                CodecError::Container(s) => CodecError::Container(s.clone()),
+                CodecError::Unsupported(s) => CodecError::Unsupported(s.clone()),
+                CodecError::Cancelled => CodecError::Cancelled,
+            }),
+        }
+    }
+}
+
 struct Frames {
+    generation: u64,
+    runs: Vec<DecodeRun>,
     /// Decoded frames by presentation pts (bounded).
     frames: BTreeMap<i64, Arc<VideoFrame>>,
     /// Cached pictures already returned to a caller.
@@ -374,6 +408,52 @@ impl Drop for OutputPin<'_> {
     }
 }
 
+/// Every elected owner completes its generation, including early errors and unwinding.
+/// Completed records live only until their registered waiters have observed the outcome.
+struct RunOwner<'a> {
+    shared: &'a Shared,
+    generation: u64,
+    outcome: RunOutcome,
+}
+
+impl RunOwner<'_> {
+    fn finish(&mut self, result: &crate::Result<Taken>, want_pts: i64, draft: bool) {
+        self.outcome = match result {
+            Ok(_) if lock_frames(&self.shared.frames).cached(want_pts, draft).is_some() => RunOutcome::Produced,
+            Ok(_) => RunOutcome::EndedWithoutFrame,
+            Err(CodecError::Cancelled) => RunOutcome::Cancelled,
+            Err(error) => RunOutcome::Error(Arc::new(match error {
+                CodecError::Decode(s) => CodecError::Decode(s.clone()),
+                CodecError::Container(s) => CodecError::Container(s.clone()),
+                CodecError::Unsupported(s) => CodecError::Unsupported(s.clone()),
+                CodecError::Cancelled => CodecError::Cancelled,
+            })),
+        };
+    }
+}
+
+impl Drop for RunOwner<'_> {
+    fn drop(&mut self) {
+        let mut frames = lock_frames(&self.shared.frames);
+        if let Some(run) = frames.runs.iter_mut().find(|run| run.generation == self.generation) {
+            run.outcome = Some(std::mem::replace(&mut self.outcome, RunOutcome::EndedWithoutFrame));
+        }
+        frames.runs.retain(|run| run.outcome.is_none() || run.waiters > 0);
+        self.shared.frame_ready.notify_all();
+    }
+}
+
+#[cfg(test)]
+type RunHook = Arc<dyn Fn(RunEvent) + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum RunEvent {
+    Waiting,
+    Decoding,
+    Published(i64),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SeekCause {
     DecoderRecycled,
@@ -473,7 +553,20 @@ struct Shared {
     // Lock order: decoder state, then frames. Never decode or trim other caches with frames held.
     state: Mutex<State>,
     frames: Mutex<Frames>,
+    frame_ready: Condvar,
+    #[cfg(test)]
+    run_hook: Mutex<Option<RunHook>>,
     pool: Arc<Pool>,
+}
+
+#[cfg(test)]
+impl Shared {
+    fn run_event(&self, event: RunEvent) {
+        let hook = self.run_hook.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(hook) = hook {
+            hook(event);
+        }
+    }
 }
 
 impl Drop for Shared {
@@ -768,6 +861,8 @@ impl GopCache {
                 out_max: i64::MIN,
             }),
             frames: Mutex::new(Frames {
+                generation: 0,
+                runs: Vec::new(),
                 frames: BTreeMap::new(),
                 used: BTreeSet::new(),
                 evicted: BTreeSet::new(),
@@ -780,6 +875,9 @@ impl GopCache {
                 export_position: None,
                 background: false,
             }),
+            frame_ready: Condvar::new(),
+            #[cfg(test)]
+            run_hook: Mutex::new(None),
             pool: pool.clone(),
         });
         pool.register(&shared);
@@ -957,7 +1055,10 @@ impl GopCache {
             st.out_max = st.out_max.max(d.pts);
             let mut frames = lock_frames(&self.shared.frames);
             self.store(&mut frames, d.pts, d.frame, d.draft);
+            self.shared.frame_ready.notify_all();
             drop(frames);
+            #[cfg(test)]
+            self.shared.run_event(RunEvent::Published(d.pts));
             self.shared.pool.trim_frames(&self.shared);
         }
     }
@@ -1020,9 +1121,85 @@ impl GopCache {
         }
         let draft = filmcraft_media::cancel::draft();
         let background = filmcraft_media::cancel::background();
-        if let Some(taken) = self.cached(want_pts, draft, background) {
-            return Ok(taken);
-        }
+        let wait = Instant::now();
+        let mut frames = lock_frames(&self.shared.frames);
+        LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        let mut waiting = None;
+        let mut owner = loop {
+            // Lookup, generation completion, and election use this one mutex. In particular,
+            // no decoder lock is acquired until after the elected run is visible here.
+            let taken = Self::take_cached(&mut frames, want_pts, draft, background);
+            let cancelled = filmcraft_media::cancel::cancelled();
+            let outcome = waiting.and_then(|generation| frames.runs.iter().find(|run| run.generation == generation).and_then(|run| run.outcome.as_ref()));
+            let ended = outcome.is_some();
+            let error = outcome.and_then(RunOutcome::error);
+            if taken.is_some() || cancelled || ended {
+                if let Some(generation) = waiting.take() {
+                    if let Some(run) = frames.runs.iter_mut().find(|run| run.generation == generation) {
+                        run.waiters = run.waiters.saturating_sub(1);
+                    }
+                    frames.runs.retain(|run| run.outcome.is_none() || run.waiters > 0);
+                }
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                if let Some(taken) = taken {
+                    return Ok(taken);
+                }
+                if cancelled {
+                    return Err(CodecError::Cancelled);
+                }
+                // A suppressed/skipped/missing picture takes the normal owner path again,
+                // including decode_until's nearest-picture and no-floor fallbacks.
+            }
+            if waiting.is_none() {
+                if let Some(run) =
+                    frames.runs.iter_mut().find(|run| run.outcome.is_none() && run.first_pts <= want_pts && want_pts <= run.target_pts && (draft || !run.draft))
+                {
+                    run.waiters = run.waiters.checked_add(1).ok_or_else(|| CodecError::Decode("too many frame waiters".into()))?;
+                    waiting = Some(run.generation);
+                    #[cfg(test)]
+                    self.shared.run_event(RunEvent::Waiting);
+                } else {
+                    let generation = frames.generation.checked_add(1).ok_or_else(|| CodecError::Decode("decode generation exhausted".into()))?;
+                    frames.generation = generation;
+                    frames.runs.push(DecodeRun {
+                        generation,
+                        first_pts: s.pts(decode_start(s, i)).min(want_pts),
+                        target_pts: want_pts,
+                        draft,
+                        waiters: 0,
+                        outcome: None,
+                    });
+                    break RunOwner {
+                        shared: &self.shared,
+                        generation,
+                        outcome: RunOutcome::Error(Arc::new(CodecError::Decode("decode run interrupted".into()))),
+                    };
+                }
+            }
+            let _wait = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::FrameWait);
+            let (next, _) = self.shared.frame_ready.wait_timeout(frames, Duration::from_millis(10)).unwrap_or_else(PoisonError::into_inner);
+            frames = next;
+        };
+        drop(frames);
+        let result = self.frame_owner(s, i, want_pts, late_before, draft, background, me, owner.generation);
+        owner.finish(&result, want_pts, draft);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn frame_owner(
+        &self,
+        s: &dyn VideoSamples,
+        i: usize,
+        want_pts: i64,
+        late_before: Option<i64>,
+        draft: bool,
+        background: bool,
+        me: usize,
+        generation: u64,
+    ) -> crate::Result<Taken> {
         // Idle caches' decoders released below. Declared before the lock guard, so it is dropped
         // after the guard on every return path: dropping a decoder can block.
         let mut released: Vec<Box<dyn VideoDecoder>> = Vec::new();
@@ -1071,7 +1248,9 @@ impl GopCache {
         // with the lock held: see `isolated`
         let _pin = OutputPin::new(&self.shared.frames, want_pts);
         let st = &mut *st;
-        let taken = isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft))?;
+        #[cfg(test)]
+        self.shared.run_event(RunEvent::Decoding);
+        let taken = isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft, generation))?;
         lock_frames(&self.shared.frames).count_used(taken.pts);
         Ok(taken)
     }
@@ -1081,6 +1260,10 @@ impl GopCache {
         let wait = Instant::now();
         let mut frames = lock_frames(&self.shared.frames);
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        Self::take_cached(&mut frames, want_pts, draft, background)
+    }
+
+    fn take_cached(frames: &mut Frames, want_pts: i64, draft: bool, background: bool) -> Option<Taken> {
         frames.last_used = Instant::now();
         frames.pin = want_pts;
         let frame = frames.cached(want_pts, draft)?.clone();
@@ -1092,7 +1275,17 @@ impl GopCache {
     }
 
     /// Decode (the lock held) until the frame with `want_pts` (sample `i`) is cached; return it.
-    fn decode_until(&self, st: &mut State, s: &dyn VideoSamples, i: usize, want_pts: i64, late_before: Option<i64>, draft: bool) -> crate::Result<Taken> {
+    #[allow(clippy::too_many_arguments)]
+    fn decode_until(
+        &self,
+        st: &mut State,
+        s: &dyn VideoSamples,
+        i: usize,
+        want_pts: i64,
+        late_before: Option<i64>,
+        draft: bool,
+        generation: u64,
+    ) -> crate::Result<Taken> {
         let n = s.count();
         let mut allow_floor = filmcraft_media::cancel::export();
         loop {
@@ -1108,6 +1301,15 @@ impl GopCache {
             let near = st.next <= key && key - st.next <= CONTINUE_THROUGH;
             let continuing = running && (st.next > key || near) && (i >= st.next || (st.start <= i && want_pts > st.out_max));
             let floored = !continuing && allow_floor;
+            {
+                let mut frames = lock_frames(&self.shared.frames);
+                if let Some(run) = frames.runs.iter_mut().find(|run| run.generation == generation) {
+                    // Include continuation's pre-roll. Output suppression, disposable samples,
+                    // and decoder PTS quirks can still leave holes; completion releases those.
+                    let first = if continuing { st.next.min(n.saturating_sub(1)) } else { key };
+                    run.first_pts = run.first_pts.min(s.pts(first));
+                }
+            }
             if !continuing {
                 SEEKS.fetch_add(1, Ordering::Relaxed);
                 let counter = match st.seek_cause(&lock_frames(&self.shared.frames), i, key, want_pts) {
@@ -1298,7 +1500,10 @@ impl GopCache {
         for d in res? {
             let mut frames = lock_frames(&self.shared.frames);
             self.store(&mut frames, d.pts, d.frame, d.draft);
+            self.shared.frame_ready.notify_all();
             drop(frames);
+            #[cfg(test)]
+            self.shared.run_event(RunEvent::Published(d.pts));
             self.shared.pool.trim_frames(&self.shared);
         }
         let mut frames = lock_frames(&self.shared.frames);

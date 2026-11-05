@@ -14,6 +14,7 @@ use web_time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     DecoderQueue,
+    FrameWait,
     DecodeWait,
     FrameMapWait,
     Composite,
@@ -22,16 +23,17 @@ pub enum Phase {
     Other,
 }
 
-const PHASES: [Phase; 7] = [Phase::DecoderQueue, Phase::DecodeWait, Phase::FrameMapWait, Phase::Composite, Phase::Effects, Phase::Convert, Phase::Other];
+const PHASES: [Phase; 8] =
+    [Phase::DecoderQueue, Phase::FrameWait, Phase::DecodeWait, Phase::FrameMapWait, Phase::Composite, Phase::Effects, Phase::Convert, Phase::Other];
 static TOTAL: AtomicU64 = AtomicU64::new(0);
-static PARTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static DECODE_RUN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct Clock {
     phase: Phase,
     since: Instant,
-    ns: [u64; 7],
+    ns: [u64; 8],
 }
 
 impl Clock {
@@ -129,7 +131,7 @@ pub fn task<T>(f: impl FnOnce() -> T) -> T {
             clock.settle(now);
             clock
         });
-        c.set(Some(Clock { phase: Phase::Other, since: now, ns: [0; 7] }));
+        c.set(Some(Clock { phase: Phase::Other, since: now, ns: [0; 8] }));
         parent
     });
     let _task = Task(parent);
@@ -164,6 +166,7 @@ pub fn times() -> Vec<(&'static str, u64)> {
     for (phase, counter) in PHASES.into_iter().zip(PARTS.iter()) {
         let name = match phase {
             Phase::DecoderQueue => "decoderQueueMs",
+            Phase::FrameWait => "frameWaitMs",
             Phase::DecodeWait => "decodeWaitMs",
             Phase::FrameMapWait => "frameMapWaitMs",
             Phase::Composite => "compositeMs",

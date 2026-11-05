@@ -185,6 +185,9 @@ impl VideoDecoder for FloorDec {
     fn name(&self) -> &str {
         "floor readback mock"
     }
+    fn is_disposable(&self, sample: &[u8]) -> bool {
+        self.inner.is_disposable(sample)
+    }
 }
 
 impl<S: VideoSamples> VideoSamples for FloorSamples<S> {
@@ -1645,4 +1648,163 @@ fn release_idle_empties_idle_caches_and_leaves_one_in_use_alone() {
     pool.release_idle();
     assert_eq!(pool.bytes.load(Ordering::Relaxed), 0);
     assert_eq!(pool.decoders.load(Ordering::Relaxed), 0);
+}
+
+const RUN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// All test gates time out, including gates inside decode workers. No sleeping or unbounded
+/// thread joins: a stalled request fails its result channel's deadline.
+struct RunControl {
+    decoding: std::sync::mpsc::Receiver<()>,
+    waiting: std::sync::mpsc::Receiver<()>,
+    published: std::sync::mpsc::Receiver<()>,
+    resume: std::sync::mpsc::Sender<()>,
+}
+
+fn pause_run(cache: &GopCache, publish_at: Option<i64>) -> RunControl {
+    let (decoding_tx, decoding) = std::sync::mpsc::channel();
+    let (waiting_tx, waiting) = std::sync::mpsc::channel();
+    let (published_tx, published) = std::sync::mpsc::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = Mutex::new(resume_rx);
+    let first_decode = std::sync::atomic::AtomicBool::new(true);
+    let first_publish = std::sync::atomic::AtomicBool::new(true);
+    *cache.shared.run_hook.lock().unwrap() = Some(Arc::new(move |event| match event {
+        RunEvent::Decoding if first_decode.swap(false, Ordering::Relaxed) => {
+            decoding_tx.send(()).expect("decode entered");
+            resume_rx.lock().unwrap().recv_timeout(RUN_TIMEOUT).expect("resume decode");
+        }
+        RunEvent::Waiting => {
+            waiting_tx.send(()).expect("waiter entered");
+        }
+        RunEvent::Published(pts) if publish_at == Some(pts) && first_publish.swap(false, Ordering::Relaxed) => {
+            published_tx.send(()).expect("frame published");
+            resume_rx.lock().unwrap().recv_timeout(RUN_TIMEOUT).expect("resume publication");
+        }
+        _ => {}
+    }));
+    RunControl { decoding, waiting, published, resume }
+}
+
+fn request_frame<S: VideoSamples + Send + 'static>(
+    cache: Arc<GopCache>,
+    samples: Arc<S>,
+    target: i64,
+    late: Option<i64>,
+    export: bool,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> std::sync::mpsc::Receiver<crate::Result<Arc<VideoFrame>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let frame = || filmcraft_media::cancel::with_export(export, || cache.frame_late(&*samples, target, late));
+        let result = match cancel {
+            Some(flag) => filmcraft_media::cancel::with_cancel(&flag, frame),
+            None => frame(),
+        };
+        tx.send(result).expect("request result");
+    });
+    rx
+}
+
+#[test]
+fn frame_waiter_returns_while_owner_still_holds_decoder_lock() {
+    let samples = Arc::new(samples(20, 20, 0, false));
+    let cache = Arc::new(GopCache::new(None));
+    let control = pause_run(&cache, Some(3_000));
+    let owner = request_frame(cache.clone(), samples.clone(), 5_000, None, false, None);
+    control.decoding.recv_timeout(RUN_TIMEOUT).expect("owner holds decoder");
+    let waiter = request_frame(cache.clone(), samples, 3_000, None, false, None);
+    control.waiting.recv_timeout(RUN_TIMEOUT).expect("registered waiter");
+    control.resume.send(()).unwrap();
+    control.published.recv_timeout(RUN_TIMEOUT).expect("published while locked");
+    assert_eq!(index_of(&waiter.recv_timeout(RUN_TIMEOUT).expect("waiter returned").expect("frame")), 3);
+    assert!(matches!(cache.shared.state.try_lock(), Err(TryLockError::WouldBlock)));
+    control.resume.send(()).unwrap();
+    assert_eq!(index_of(&owner.recv_timeout(RUN_TIMEOUT).expect("owner returned").expect("frame")), 5);
+    assert!(cache.shared.frames.lock().unwrap().runs.is_empty());
+}
+
+#[test]
+fn frame_waiter_retries_after_suppressed_skipped_or_missing_output() {
+    // Floor-suppressed and skipped pre-roll must be retried as ordinary requests. A missing
+    // target also retains the existing no-floor retry and nearest-picture fallback.
+    for (export, late, omit, owner_pts, expected) in [(true, None, None, 5_000, 3), (false, Some(5_000), None, 5_000, 3), (true, None, Some(3_000), 3_000, 2)] {
+        let mut samples = FloorSamples::new(samples(20, 20, 0, false));
+        samples.omit = omit;
+        let samples = Arc::new(samples);
+        let cache = Arc::new(GopCache::new(None));
+        let control = pause_run(&cache, None);
+        let owner = request_frame(cache.clone(), samples.clone(), owner_pts, late, export, None);
+        control.decoding.recv_timeout(RUN_TIMEOUT).expect("owner elected");
+        let waiter = request_frame(cache.clone(), samples.clone(), 3_000, None, export, None);
+        control.waiting.recv_timeout(RUN_TIMEOUT).expect("waiter registered");
+        control.resume.send(()).unwrap();
+        owner.recv_timeout(RUN_TIMEOUT).expect("owner returned").expect("owner frame");
+        assert_eq!(index_of(&waiter.recv_timeout(RUN_TIMEOUT).expect("waiter retried").expect("waiter frame")), expected);
+        assert!(samples.samples.resets.load(Ordering::Relaxed) >= 2, "waiter started another run");
+        if omit.is_some() {
+            assert_eq!(samples.samples.resets.load(Ordering::Relaxed), 4, "both requests retry without floor");
+        }
+        assert!(cache.shared.frames.lock().unwrap().runs.is_empty());
+    }
+}
+
+#[test]
+fn decode_error_wakes_frame_waiters_with_the_same_error() {
+    let mut samples = FloorSamples::new(samples(20, 20, 0, false));
+    samples.fail = Some(0);
+    let samples = Arc::new(samples);
+    let cache = Arc::new(GopCache::new(None));
+    let control = pause_run(&cache, None);
+    let owner = request_frame(cache.clone(), samples.clone(), 5_000, None, true, None);
+    control.decoding.recv_timeout(RUN_TIMEOUT).expect("owner elected");
+    let waiters: Vec<_> = (0..2).map(|_| request_frame(cache.clone(), samples.clone(), 3_000, None, false, None)).collect();
+    for _ in &waiters {
+        control.waiting.recv_timeout(RUN_TIMEOUT).expect("waiter registered");
+    }
+    control.resume.send(()).unwrap();
+    for result in std::iter::once(owner).chain(waiters) {
+        assert!(matches!(result.recv_timeout(RUN_TIMEOUT).expect("error delivered"), Err(CodecError::Decode(s)) if s == "mock decode error"));
+    }
+    assert_eq!(samples.samples.resets.load(Ordering::Relaxed), 1, "waiters receive the error without retrying");
+    assert!(cache.shared.frames.lock().unwrap().runs.is_empty());
+}
+
+#[test]
+fn owner_cancellation_wakes_frame_waiters() {
+    let samples = Arc::new(samples(20, 20, 0, false));
+    let cache = Arc::new(GopCache::new(None));
+    // Pause after publication, inside isolated decoding, so its cancellation context is tested.
+    let control = pause_run(&cache, Some(0));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let owner = request_frame(cache.clone(), samples.clone(), 5_000, None, false, Some(cancelled.clone()));
+    control.decoding.recv_timeout(RUN_TIMEOUT).expect("owner elected");
+    let waiter = request_frame(cache.clone(), samples, 3_000, None, false, None);
+    control.waiting.recv_timeout(RUN_TIMEOUT).expect("waiter registered");
+    control.resume.send(()).unwrap();
+    control.published.recv_timeout(RUN_TIMEOUT).expect("decode in progress");
+    cancelled.store(true, Ordering::Relaxed);
+    control.resume.send(()).unwrap();
+    for result in [owner, waiter] {
+        assert!(matches!(result.recv_timeout(RUN_TIMEOUT).expect("cancel delivered"), Err(CodecError::Cancelled)));
+    }
+    assert!(cache.shared.frames.lock().unwrap().runs.is_empty());
+}
+
+#[test]
+fn frame_waiter_cancels_independently_while_owner_keeps_running() {
+    let samples = Arc::new(samples(20, 20, 0, false));
+    let cache = Arc::new(GopCache::new(None));
+    let control = pause_run(&cache, None);
+    let owner = request_frame(cache.clone(), samples.clone(), 5_000, None, false, None);
+    control.decoding.recv_timeout(RUN_TIMEOUT).expect("owner holds decoder");
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiter = request_frame(cache.clone(), samples, 3_000, None, false, Some(cancelled.clone()));
+    control.waiting.recv_timeout(RUN_TIMEOUT).expect("waiter registered");
+    cancelled.store(true, Ordering::Relaxed);
+    assert!(matches!(waiter.recv_timeout(RUN_TIMEOUT).expect("waiter promptly cancelled"), Err(CodecError::Cancelled)));
+    assert!(matches!(cache.shared.state.try_lock(), Err(TryLockError::WouldBlock)));
+    control.resume.send(()).unwrap();
+    assert_eq!(index_of(&owner.recv_timeout(RUN_TIMEOUT).expect("owner completed").expect("owner frame")), 5);
+    assert!(cache.shared.frames.lock().unwrap().runs.is_empty());
 }
