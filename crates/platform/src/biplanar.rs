@@ -38,6 +38,11 @@ fn row(plane: &[u8], stride: usize, y: usize, x: usize, len: usize) -> Result<&[
 /// shifting 10-bit samples down from the high bits). Errors when the surface is smaller than the
 /// rectangle needs.
 pub fn to_frame(src: &Biplanar, g: &Geometry) -> Result<VideoFrame, String> {
+    to_frame_with_chroma_stride(src, src.stride, g)
+}
+
+/// The same conversion for VA images whose two planes have independent byte pitches.
+pub(crate) fn to_frame_with_chroma_stride(src: &Biplanar, chroma_stride: usize, g: &Geometry) -> Result<VideoFrame, String> {
     let (cx, cy, w, h) = g.crop;
     let (ox, oy, w, h) = (cx as usize, cy as usize, w as usize, h as usize);
     if w == 0 || h == 0 || !matches!(g.bits, 8 | 10) {
@@ -48,7 +53,7 @@ pub fn to_frame(src: &Biplanar, g: &Geometry) -> Result<VideoFrame, String> {
     let (cox, coy) = (ox / 2, oy / 2);
     let needs_rows = oy.checked_add(h).ok_or("picture size overflows")?;
     let needs_cols = ox.checked_add(w).and_then(|c| c.checked_mul(bps)).ok_or("picture size overflows")?;
-    if src.rows < needs_rows || src.stride < needs_cols || src.stride < (cox + cw) * 2 * bps {
+    if src.rows < needs_rows || src.stride < needs_cols || chroma_stride < (cox + cw) * 2 * bps {
         return Err(format!("decoded surface ({} rows, {} byte rows) is smaller than the {w}x{h} picture at {ox},{oy}", src.rows, src.stride));
     }
     let data = if bps == 1 {
@@ -59,7 +64,7 @@ pub fn to_frame(src: &Biplanar, g: &Geometry) -> Result<VideoFrame, String> {
         let (mut u, mut v) = (pool::take_u8(cw * ch), pool::take_u8(cw * ch));
         for y in 0..ch {
             // two passes over the row: each is a simple strided copy the compiler vectorises
-            let pairs = row(src.chroma, src.stride, coy + y, cox * 2, cw * 2)?.as_chunks::<2>().0;
+            let pairs = row(src.chroma, chroma_stride, coy + y, cox * 2, cw * 2)?.as_chunks::<2>().0;
             u.extend(pairs.iter().map(|p| p[0]));
             v.extend(pairs.iter().map(|p| p[1]));
         }
@@ -72,7 +77,7 @@ pub fn to_frame(src: &Biplanar, g: &Geometry) -> Result<VideoFrame, String> {
         }
         let (mut u, mut v) = (pool::take_u16(cw * ch), pool::take_u16(cw * ch));
         for y in 0..ch {
-            let quads = row(src.chroma, src.stride, coy + y, cox * 4, cw * 4)?.as_chunks::<4>().0;
+            let quads = row(src.chroma, chroma_stride, coy + y, cox * 4, cw * 4)?.as_chunks::<4>().0;
             u.extend(quads.iter().map(|q| u16::from_le_bytes([q[0], q[1]]) >> shift));
             v.extend(quads.iter().map(|q| u16::from_le_bytes([q[2], q[3]]) >> shift));
         }

@@ -438,3 +438,10 @@ fn hevc_slice_bit_fields_match_the_header() {
     assert_eq!(1u32 << hevc_slice_bits::COLLOCATED_FROM_L0, 0x1000, "LongSliceFlags.collocated_from_l0_flag");
     assert_eq!(1u32 << hevc_slice_bits::SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED, 0x2000, "LongSliceFlags.slice_loop_filter_across_slices_enabled_flag");
 }
+
+#[test]
+fn vaderiveimage_signature_matches_the_header() {
+    // va.h: VAStatus vaDeriveImage(VADisplay, VASurfaceID, VAImage *out).
+    let _: Option<unsafe extern "C" fn(VADisplay, VASurfaceID, *mut VAImage) -> VAStatus> = None::<vaDeriveImage>;
+    assert_eq!(size_of::<vaDeriveImage>(), size_of::<*const ()>());
+}

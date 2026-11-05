@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use filmcraft_codecs::hw::{note_hw_copy, note_hw_get_image, note_hw_readback, note_hw_submit, note_hw_sync};
-use filmcraft_frame::VideoFrame;
+use filmcraft_frame::{VideoFrame, pool};
 use libloading::Library;
 
 use super::Accel;
@@ -46,6 +46,7 @@ struct Api {
     end_picture: ffi::vaEndPicture,
     sync_surface: ffi::vaSyncSurface,
     create_image: ffi::vaCreateImage,
+    derive_image: ffi::vaDeriveImage,
     destroy_image: ffi::vaDestroyImage,
     get_image: ffi::vaGetImage,
     put_image: ffi::vaPutImage,
@@ -96,6 +97,7 @@ fn load() -> Result<Api, String> {
         end_picture: sym!(va, vaEndPicture),
         sync_surface: sym!(va, vaSyncSurface),
         create_image: sym!(va, vaCreateImage),
+        derive_image: sym!(va, vaDeriveImage),
         destroy_image: sym!(va, vaDestroyImage),
         get_image: sym!(va, vaGetImage),
         put_image: sym!(va, vaPutImage),
@@ -256,6 +258,9 @@ pub struct Session {
     context: ffi::VAContextID,
     surfaces: Vec<VASurfaceID>,
     image: Option<VAImage>,
+    /// None until the first derive attempt; only derive success and format decide support.
+    derive_supported: Option<bool>,
+    readback: ReadbackBuffer,
     /// Coded size of the surfaces (luma samples).
     size: (u32, u32),
     geometry: Geometry,
@@ -323,7 +328,17 @@ impl Session {
         }
         let config = config.ok_or(why)?;
         // From here on `Drop` releases what was made.
-        let mut s = Self { display, config, context: ffi::VA_INVALID_ID, surfaces: Vec::new(), image: None, size, geometry };
+        let mut s = Self {
+            display,
+            config,
+            context: ffi::VA_INVALID_ID,
+            surfaces: Vec::new(),
+            image: None,
+            derive_supported: None,
+            readback: ReadbackBuffer::default(),
+            size,
+            geometry,
+        };
         let count_c = c_uint::try_from(count).map_err(|_| "too many surfaces")?;
         let mut surfaces = vec![ffi::VA_INVALID_SURFACE; count];
         // SAFETY: `surfaces` has room for `count` ids; no attributes are passed (null, 0).
@@ -480,30 +495,115 @@ impl Session {
         decoded
     }
 
-    fn read_image(&self, image: &VAImage) -> Result<VideoFrame, String> {
+    /// Derive and read one image; None requests vaGetImage after releasing the derived image.
+    fn read_derived(&mut self, surface: VASurfaceID) -> Result<Option<VideoFrame>, String> {
+        let (_, fourcc, _) = formats(self.geometry.bits)?;
+        let api = self.display.api;
+        let mut image = VAImage { image_id: ffi::VA_INVALID_ID, buf: ffi::VA_INVALID_ID, ..Default::default() };
+        // SAFETY: `surface` belongs to this session and has been synced; `image` is a live output.
+        let st = unsafe { (api.derive_image)(self.display.dpy, surface, &mut image) };
+        if let Err(error) = self.display.check(st, "vaDeriveImage") {
+            return derived_readback(&mut self.derive_supported, false, Err(ReadbackError::Unavailable(error)));
+        }
+        let readable = image.format.fourcc == fourcc;
+        let result =
+            if readable { self.read_image(&image) } else { Err(ReadbackError::Unavailable("derived image does not match the decoded sample format".into())) };
+        // SAFETY: a successful vaDeriveImage created this image and buffer; read_image has
+        // attempted to unmap every successful mapping, and no mapped data is still used.
+        // Destroying the image releases both, leaving the surface alive.
+        let st = unsafe { (api.destroy_image)(self.display.dpy, image.image_id) };
+        // Cleanup errors must remain errors, including when mapping requested a fallback.
+        let result = self.display.check(st, "vaDestroyImage").map_err(ReadbackError::Other).and(result);
+        derived_readback(&mut self.derive_supported, readable, result)
+    }
+
+    fn read_image(&mut self, image: &VAImage) -> Result<VideoFrame, ReadbackError> {
         let started = Instant::now();
         let result = (|| {
             let api = self.display.api;
             let mut ptr: *mut c_void = std::ptr::null_mut();
             // SAFETY: `image.buf` is the data buffer of an image made on this display; `ptr` is a live output.
             let st = unsafe { (api.map_buffer)(self.display.dpy, image.buf, &mut ptr) };
-            self.display.check(st, "vaMapBuffer")?;
-            let result = if ptr.is_null() {
-                Err("vaMapBuffer returned no data".to_string())
-            } else {
-                // SAFETY: a mapped image buffer holds `data_size` bytes at `ptr` until it is unmapped
-                // below; the slice does not outlive this block.
-                let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().cast_const(), image.data_size as usize) };
-                biplanar_view(image, data).and_then(|b| biplanar::to_frame(&b, &self.geometry))
-            };
-            // SAFETY: the buffer was mapped above; `data` is no longer used.
+            self.display.check(st, "vaMapBuffer").map_err(ReadbackError::Unavailable)?;
+            let copied = (|| {
+                if ptr.is_null() {
+                    return Err(ReadbackError::Unavailable("vaMapBuffer returned no data".into()));
+                }
+                let len = readback_len(image.data_size)?;
+                // SAFETY: a mapped image buffer holds `data_size` readable bytes until unmapped
+                // below. readback_len bounds the slice below isize::MAX, and it stays in this block.
+                let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().cast_const(), len) };
+                self.readback.copy(data).map_err(ReadbackError::Other)
+            })();
+            // SAFETY: the buffer was mapped above; the mapped slice is no longer used.
             let st = unsafe { (api.unmap_buffer)(self.display.dpy, image.buf) };
-            let frame = result?;
             self.display.check(st, "vaUnmapBuffer")?;
-            Ok(frame)
+            copied?;
+            // All strided reads and conversion now happen in cached CPU memory, after unmapping.
+            let b = biplanar_view(image, &self.readback.bytes)?;
+            biplanar::to_frame_with_chroma_stride(&b, image.pitches[1] as usize, &self.geometry).map_err(ReadbackError::Other)
         })();
         note_hw_copy(started.elapsed().as_nanos() as u64);
         result
+    }
+}
+
+/// Only derive/map failures may select the vaGetImage fallback.
+#[derive(Debug)]
+enum ReadbackError {
+    Unavailable(String),
+    Other(String),
+}
+
+impl From<String> for ReadbackError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl ReadbackError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unavailable(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+fn derived_readback<T>(supported: &mut Option<bool>, readable: bool, result: Result<T, ReadbackError>) -> Result<Option<T>, String> {
+    supported.get_or_insert(readable);
+    match result {
+        Ok(frame) => Ok(Some(frame)),
+        Err(ReadbackError::Unavailable(_)) => Ok(None),
+        Err(ReadbackError::Other(error)) => Err(error),
+    }
+}
+
+/// A single-slot pool owned by the session. The first allocation may come from the frame pool;
+/// keeping it checked out avoids allocator and pool traffic on subsequent pictures.
+#[derive(Default)]
+struct ReadbackBuffer {
+    bytes: Vec<u8>,
+}
+
+fn readback_len(size: u32) -> Result<usize, String> {
+    // Bound driver-sized allocations (enough for padded 8192x8192 P010 surfaces).
+    let len = usize::try_from(size).map_err(|_| "readback buffer too large")?;
+    if len > (512 << 20) || len > isize::MAX as usize {
+        return Err("readback buffer too large".into());
+    }
+    Ok(len)
+}
+
+impl ReadbackBuffer {
+    fn copy(&mut self, data: &[u8]) -> Result<(), String> {
+        readback_len(u32::try_from(data.len()).map_err(|_| "readback buffer too large")?)?;
+        if self.bytes.capacity() == 0 {
+            self.bytes = pool::take_u8(data.len());
+        }
+        self.bytes.try_reserve(data.len().saturating_sub(self.bytes.len())).map_err(|e| format!("readback buffer: {e}"))?;
+        self.bytes.resize(data.len(), 0);
+        self.bytes.copy_from_slice(data);
+        Ok(())
     }
 }
 
@@ -512,10 +612,7 @@ fn biplanar_view<'a>(image: &VAImage, data: &'a [u8]) -> Result<Biplanar<'a>, St
     if !matches!(image.format.fourcc, ffi::VA_FOURCC_NV12 | ffi::VA_FOURCC_P010) || image.num_planes < 2 {
         return Err(format!("the read-back image is not NV12 / P010 (fourcc {:#x}, {} planes)", image.format.fourcc, image.num_planes));
     }
-    let [p0, p1, _] = image.pitches;
-    if p0 != p1 {
-        return Err(format!("NV12 planes with different pitches ({p0}, {p1})"));
-    }
+    let [p0, _, _] = image.pitches;
     let luma = data.get(image.offsets[0] as usize..).ok_or("NV12 luma offset out of range")?;
     let chroma = data.get(image.offsets[1] as usize..).ok_or("NV12 chroma offset out of range")?;
     Ok(Biplanar { luma, chroma, stride: p0 as usize, rows: usize::from(image.height) })
@@ -548,8 +645,19 @@ impl Accel for Session {
 
     fn read(&mut self, index: usize) -> Result<VideoFrame, String> {
         note_hw_readback();
+        if self.derive_supported != Some(false) {
+            let surface = *self.surfaces.get(index).ok_or("surface out of range")?;
+            let started = Instant::now();
+            // SAFETY: `surface` belongs to this session; no other thread uses the session.
+            let st = unsafe { (self.display.api.sync_surface)(self.display.dpy, surface) };
+            note_hw_sync(started.elapsed().as_nanos() as u64);
+            self.display.check(st, "vaSyncSurface")?;
+            if let Some(frame) = self.read_derived(surface)? {
+                return Ok(frame);
+            }
+        }
         let image = self.get_image(index)?;
-        self.read_image(&image)
+        self.read_image(&image).map_err(ReadbackError::into_message)
     }
 
     fn fill(&mut self, index: usize, from: Option<usize>) -> Result<(), String> {
@@ -599,4 +707,150 @@ pub fn probe() -> &'static Result<String, String> {
     static PROBE: OnceLock<Result<String, String>> = OnceLock::new();
     // the display opened to answer is the one sessions share
     PROBE.get_or_init(|| shared().map(|d| d.vendor().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filmcraft_frame::PixelData;
+
+    #[test]
+    fn derive_probe_success_keeps_support_after_picture_failures() {
+        let mut supported = None;
+        assert_eq!(derived_readback(&mut supported, true, Ok(1)).unwrap(), Some(1));
+        assert_eq!(supported, Some(true));
+        for (readable, error) in [(false, "vaDeriveImage failed"), (true, "vaMapBuffer failed")] {
+            let result = derived_readback::<u8>(&mut supported, readable, Err(ReadbackError::Unavailable(error.into())));
+            assert_eq!(result.unwrap(), None, "None selects vaGetImage for this picture");
+            assert_eq!(supported, Some(true));
+        }
+        // A readable probe remains supported even if the first picture fails after mapping.
+        let mut supported = None;
+        let result = derived_readback::<u8>(&mut supported, true, Err(ReadbackError::Other("conversion failed".into())));
+        assert_eq!(result.unwrap_err(), "conversion failed");
+        assert_eq!(supported, Some(true));
+    }
+
+    fn fixture(bits: u32, unequal_pitches: bool) -> (VAImage, Vec<u8>) {
+        let bps = if bits == 8 { 1 } else { 2 };
+        let p0 = 12 * bps;
+        let p1 = if unequal_pitches { p0 + 4 } else { p0 };
+        let offsets = [5, 5 + p0 * 8 + 8, 0];
+        let image = VAImage {
+            format: VAImageFormat { fourcc: formats(bits).unwrap().1, ..Default::default() },
+            width: 8,
+            height: 8,
+            num_planes: 2,
+            pitches: [p0, p1, 0],
+            offsets,
+            data_size: offsets[1] + p1 * 4 + 11,
+            ..Default::default()
+        };
+        let mut data = vec![0xed; image.data_size as usize];
+        for plane in 0..2 {
+            for y in 0..if plane == 0 { 8 } else { 4 } {
+                for x in 0..8 {
+                    let value = sample(plane, x, y);
+                    let at = image.offsets[plane] as usize + y * image.pitches[plane] as usize + x * bps as usize;
+                    if bits == 8 {
+                        data[at] = value as u8;
+                    } else {
+                        // Nonzero insignificant bits must be discarded, without rounding.
+                        data[at..at + 2].copy_from_slice(&((value << 6) | 37).to_le_bytes());
+                    }
+                }
+            }
+        }
+        (image, data)
+    }
+
+    fn sample(plane: usize, x: usize, y: usize) -> u16 {
+        (plane * 101 + y * 17 + x * 3) as u16
+    }
+
+    fn planes(frame: &VideoFrame) -> [Vec<u16>; 3] {
+        match &frame.data {
+            PixelData::Yuv8 { planes, .. } => planes.each_ref().map(|p| p.iter().map(|&v| u16::from(v)).collect()),
+            PixelData::Yuv16 { planes, .. } => planes.each_ref().map(|p| p.to_vec()),
+            _ => panic!("expected planar YUV"),
+        }
+    }
+
+    fn check_bulk_copy(bits: u32, unequal_pitches: bool) {
+        let (image, data) = fixture(bits, unequal_pitches);
+        let mut buffer = ReadbackBuffer::default();
+        buffer.copy(&data).unwrap();
+        assert_eq!(buffer.bytes, data, "one copy includes both planes, offsets and padding");
+        // Repack chroma to the luma pitch for the original, common-stride conversion path.
+        let p0 = image.pitches[0] as usize;
+        let p1 = image.pitches[1] as usize;
+        let mut old_chroma = vec![0; p0 * 4];
+        for y in 0..4 {
+            let at = image.offsets[1] as usize + y * p1;
+            old_chroma[y * p0..(y + 1) * p0].copy_from_slice(&data[at..at + p0]);
+        }
+        for crop in [(0, 0, 8, 8), (2, 2, 4, 4), (1, 1, 5, 5), (3, 3, 3, 3)] {
+            let g = Geometry { crop, bits, color: filmcraft_color::ColorInfo::REC709, par: (4, 3) };
+            let old_view = Biplanar { luma: &data[image.offsets[0] as usize..], chroma: &old_chroma, stride: p0, rows: 8 };
+            let old = biplanar::to_frame(&old_view, &g).unwrap();
+            let copied = biplanar_view(&image, &buffer.bytes).unwrap();
+            let frame = biplanar::to_frame_with_chroma_stride(&copied, p1, &g).unwrap();
+            assert_eq!(planes(&frame), planes(&old), "old and copied path: {bits} bits, {crop:?}");
+            assert_eq!((frame.width, frame.height, frame.color, frame.par, frame.pts), (old.width, old.height, old.color, old.par, old.pts));
+            let (ox, oy, w, h) = (crop.0 as usize, crop.1 as usize, crop.2 as usize, crop.3 as usize);
+            let expected_y: Vec<_> = (oy..oy + h).flat_map(|y| (ox..ox + w).map(move |x| sample(0, x, y))).collect();
+            let expected_chroma = |component| {
+                (oy / 2..oy / 2 + h.div_ceil(2))
+                    .flat_map(|y| (ox / 2..ox / 2 + w.div_ceil(2)).map(move |x| sample(1, x * 2 + component, y)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(planes(&frame), [expected_y, expected_chroma(0), expected_chroma(1)]);
+        }
+    }
+
+    #[test]
+    fn bulk_nv12_matches_strided_readback_with_odd_offsets_and_crops() {
+        check_bulk_copy(8, false);
+    }
+
+    #[test]
+    fn bulk_p010_matches_strided_readback_with_odd_offsets_and_crops() {
+        check_bulk_copy(10, false);
+    }
+
+    #[test]
+    fn bulk_readback_respects_independent_plane_pitches() {
+        check_bulk_copy(8, true);
+        check_bulk_copy(10, true);
+    }
+
+    #[test]
+    fn readback_pool_reuses_its_allocation_and_overwrites_old_pixels() {
+        let mut buffer = ReadbackBuffer::default();
+        buffer.copy(&vec![17; 131_071]).unwrap();
+        let ptr = buffer.bytes.as_ptr();
+        let capacity = buffer.bytes.capacity();
+        for len in [131_071, 97, 131_071] {
+            buffer.copy(&vec![83; len]).unwrap();
+            assert_eq!((buffer.bytes.as_ptr(), buffer.bytes.capacity()), (ptr, capacity));
+            assert_eq!(buffer.bytes, vec![83; len]);
+        }
+    }
+
+    #[test]
+    fn invalid_readback_layouts_return_errors() {
+        let (mut image, data) = fixture(8, false);
+        image.offsets[0] = image.data_size + 1;
+        assert!(biplanar_view(&image, &data).is_err());
+        image.offsets[0] = 5;
+        image.offsets[1] = image.data_size + 1;
+        assert!(biplanar_view(&image, &data).is_err());
+        image.offsets[1] = image.data_size - 1;
+        let b = biplanar_view(&image, &data).unwrap();
+        let g = Geometry { crop: (0, 0, 8, 8), bits: 8, color: Default::default(), par: (1, 1) };
+        assert!(biplanar::to_frame_with_chroma_stride(&b, image.pitches[1] as usize, &g).is_err());
+        image.format.fourcc = 0;
+        assert!(biplanar_view(&image, &data).is_err());
+        assert!(readback_len(u32::MAX).is_err());
+    }
 }
