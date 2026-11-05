@@ -66,6 +66,11 @@ pub(crate) struct FxStage {
     bgl: wgpu::BindGroupLayout,
     /// Draws a layer's source into a working texture (`composite.wgsl` `fs`, no blending).
     source: wgpu::RenderPipeline,
+    adjust: wgpu::RenderPipeline,
+    coverage: wgpu::RenderPipeline,
+    #[cfg(test)]
+    pub(crate) adjustments: usize,
+    coverage_target: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     pool: HashMap<(u32, u32), Vec<Target>>,
     used: HashSet<(u32, u32)>,
 }
@@ -403,7 +408,37 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
+        let adjustment_pipeline = |vertex, fragment, format| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("adjust"),
+                layout: None,
+                vertex: wgpu::VertexState { module: composite, entry_point: Some(vertex), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: composite,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        Self {
+            px: compute("fx_px"),
+            run: compute("fx_run"),
+            bgl,
+            source,
+            adjust: adjustment_pipeline("vs_full", "fs_adjust", super::ACCUM_FORMAT),
+            coverage: adjustment_pipeline("vs", "fs_adjust_coverage", wgpu::TextureFormat::R16Float),
+            #[cfg(test)]
+            adjustments: 0,
+            coverage_target: None,
+            pool: HashMap::new(),
+            used: HashSet::new(),
+        }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
@@ -558,5 +593,126 @@ impl FxStage {
             pass.set_bind_group(0, &d.bg, &[]);
             pass.dispatch_workgroups(d.groups.0, d.groups.1, 1);
         }
+    }
+}
+
+impl super::GpuCompositor {
+    /// Apply an adjustment without reading the canvas back. None requests the whole-plan CPU
+    /// fallback when evaluation or the device's effect stage cannot reproduce the operation.
+    pub(crate) fn adjust_canvas(
+        &mut self,
+        effects: &[filmcraft_project::EffectInstance],
+        time: filmcraft_time::Tick,
+        weight: &filmcraft_render::plan::AdjustWeight,
+        blend: filmcraft_render::Blend,
+    ) -> Option<()> {
+        use filmcraft_geom::Affine;
+        use filmcraft_render::Blend;
+        let (accum, canvas, size) = self.accum.as_ref()?.clone();
+        let (w, h) = size;
+        let cx = filmcraft_render::effects::FxCtx {
+            t: time,
+            px_scale: weight.px_scale,
+            seconds: 0.0,
+            timecode: "",
+            clip_name: "",
+            project: None,
+            env: None,
+            frame_rate: 24.0,
+            working: filmcraft_color::WorkingSpace::Rec709,
+        };
+        let ops: Option<Vec<FxOp>> = effects.iter().map(|e| FxOp::eval(e, &cx, w as usize, h as usize).filter(FxOp::gpu_ok)).collect();
+        let lfx = LayerFx { size, decimation: 1, turns: 0, ops: ops? };
+        if !weight.opacity.is_finite()
+            || !weight.px_scale.is_finite()
+            || ![weight.matrix.a, weight.matrix.b, weight.matrix.c, weight.matrix.d, weight.matrix.e, weight.matrix.f]
+                .iter()
+                .all(|v| v.is_finite() && v.abs() < 1e7)
+            || weight.frame_size.0 == 0
+            || weight.frame_size.1 == 0
+        {
+            return None;
+        }
+        let src = super::SrcInfo {
+            kind: 1,
+            code_scale: 1.0,
+            code_levels: 1.0,
+            alpha: 0.0,
+            chroma: size,
+            size,
+            color: filmcraft_color::ColorInfo::REC709,
+            input: None,
+        };
+        let mut source_u = Self::uniforms(&src, &Affine::IDENTITY, 1.0, Blend::Normal, size);
+        source_u[26] = 1.0; // exact integer grid in fs_fx_source
+        let source_buf = self.uniform_buffer(&source_u);
+        let source_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("adjust-source"),
+            layout: &self.layer_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: source_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&canvas) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.dummy) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.dummy) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.dummy) },
+            ],
+        });
+        let full = weight.frame_size == (w as usize, h as usize) && weight.matrix == Affine::IDENTITY;
+        let coverage_src = super::SrcInfo { size: (u32::try_from(weight.frame_size.0).ok()?, u32::try_from(weight.frame_size.1).ok()?), ..src };
+        let coverage_buf = self.uniform_buffer(&Self::uniforms(&coverage_src, &weight.matrix, 1.0, Blend::Normal, size));
+        let mut combine_u = Self::uniforms(&src, &Affine::IDENTITY, weight.opacity.clamp(0.0, 1.0), blend, size);
+        combine_u[25] = if full { 0.0 } else { 1.0 };
+        let combine_buf = self.uniform_buffer(&combine_u);
+        let below = Self::target(&self.device, &mut self.backdrop, w, h, super::ACCUM_FORMAT, wgpu::TextureUsages::COPY_DST);
+        let stage = self.fx.as_mut()?;
+        stage.begin_frame();
+        let job = stage.job(&self.device, &self.queue, &lfx, source_bg, &self.dummy)?;
+        let coverage = if full {
+            self.dummy.clone()
+        } else {
+            Self::target(&self.device, &mut stage.coverage_target, w, h, wgpu::TextureFormat::R16Float, wgpu::TextureUsages::empty())
+        };
+        let coverage_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("adjust-coverage"),
+            layout: &stage.coverage.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: coverage_buf.as_entire_binding() }],
+        });
+        let combine_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("adjust-combine"),
+            layout: &stage.adjust.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: combine_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&job.result) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&below) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&coverage) },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("adjust") });
+        enc.copy_texture_to_texture(
+            accum.as_image_copy(),
+            self.backdrop.as_ref()?.0.as_image_copy(),
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        // fs_fx_source converts Rgba16Float to Rgba32Float, then the ordinary FX compute passes run.
+        stage.record(&mut enc, &job);
+        if !full {
+            let mut pass = super::accum_pass(&mut enc, &coverage, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+            pass.set_pipeline(&stage.coverage);
+            pass.set_bind_group(0, &coverage_bg, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        {
+            let mut pass = super::accum_pass(&mut enc, &canvas, wgpu::LoadOp::Load);
+            pass.set_pipeline(&stage.adjust);
+            pass.set_bind_group(0, &combine_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+        #[cfg(test)]
+        {
+            stage.adjustments += 1;
+        }
+        stage.end_frame();
+        Some(())
     }
 }

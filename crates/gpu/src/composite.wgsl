@@ -385,19 +385,20 @@ fn fs_fx_source(in: VOut) -> @location(0) vec4<f32> {
 // Blend modes that need the destination: written without fixed-function blending.
 @fragment
 fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
-    let sp = layer_color(in.sp);
+    return blend_pixel(layer_color(in.sp), textureLoad(backdrop, vec2<i32>(in.pos.xy), 0), u32(u.p3.x));
+}
+
+// Shared destination-reading blend path, also used by adjustment layers.
+fn blend_pixel(sp: vec4<f32>, d: vec4<f32>, mode: u32) -> vec4<f32> {
     let sa = sp.a;
-    if sa <= 0.0 {
-        discard;
-    }
-    let d = textureLoad(backdrop, vec2<i32>(in.pos.xy), 0);
+    if sa <= 0.0 { return d; }
     let da = d.a;
     if da <= 0.0 {
         return sp + d * (1.0 - sa);
     }
     let cs = linear_to_srgb(sp.rgb / sa);
     let cb = linear_to_srgb(d.rgb / da);
-    let mixed = srgb_to_linear(clamp(blend_rgb(u32(u.p3.x), cb, cs), vec3(0.0), vec3(1.0)));
+    let mixed = srgb_to_linear(clamp(blend_rgb(mode, cb, cs), vec3(0.0), vec3(1.0)));
     return vec4(sp.rgb * (1.0 - da) + d.rgb * (1.0 - sa) + sa * da * mixed, sa + da - sa * da);
 }
 
@@ -418,4 +419,30 @@ fn fs_full(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let lo = c * 12.92;
     let hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
     return vec4(select(hi, lo, c <= vec3(0.0031308)), 1.0);
+}
+
+// GPU-resident adjustment coverage; the same Motion quad as a regular layer.
+@fragment
+fn fs_adjust_coverage() -> @location(0) f32 {
+    return 1.0;
+}
+
+@group(0) @binding(6) var adjust_coverage: texture_2d<f32>;
+
+// Full-canvas replacement is essential: transparent adjusted pixels must erase the original.
+@fragment
+fn fs_adjust(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let below = textureLoad(backdrop, p, 0);
+    let adj = textureLoad(tex0, p, 0);
+    var w = u.p0.x;
+    if u.p3.y != 0.0 { w *= textureLoad(adjust_coverage, p, 0).r; }
+    let mode = u32(u.p3.x);
+    if mode == 0u { return mix(below, adj, w); }
+    let sp = adj * w;
+    if mode == 1u {
+        if sp.a <= 0.0 || hash2(u32(pos.x), u32(pos.y)) >= sp.a { return below; }
+        return vec4(sp.rgb / sp.a, 1.0);
+    }
+    return blend_pixel(sp, below, mode);
 }

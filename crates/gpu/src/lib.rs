@@ -265,7 +265,7 @@ pub fn prepare(plan: &FramePlan) -> PreparedPlan {
                 .iter()
                 .flat_map(|s| match s {
                     PlanStep::Layers(layers) => vec![prepare_layers(layers)],
-                    // No source textures: execution falls back to the CPU plan executor.
+                    // Adjustment steps operate on the GPU canvas, without source uploads.
                     PlanStep::Adjust { .. } => Vec::new(),
                     PlanStep::Transition { inputs, .. } => inputs.iter().map(|ls| prepare_layers(ls)).collect(),
                 })
@@ -965,9 +965,11 @@ impl GpuCompositor {
                     let p = children.as_mut().and_then(Iterator::next);
                     self.render_plan(&FramePlan::Layers { width, height, layers: layers.clone() }, p, false, false);
                 }
-                PlanStep::Adjust { .. } => {
-                    let plan = FramePlan::Composite { width, height, steps: steps.to_vec() };
-                    return self.composite_prepared(&FramePlan::Image(filmcraft_render::plan::execute_cpu(&plan)), None);
+                PlanStep::Adjust { effects, time, weight, blend } => {
+                    if self.adjust_canvas(effects, *time, weight, *blend).is_none() {
+                        let plan = FramePlan::Composite { width, height, steps: steps.to_vec() };
+                        return self.composite_prepared(&FramePlan::Image(filmcraft_render::plan::execute_cpu(&plan)), None);
+                    }
                 }
                 PlanStep::Transition { inputs, effect, progress, .. } => {
                     let mut views = [self.dummy.clone(), self.dummy.clone()];
@@ -1279,6 +1281,8 @@ fn quad_bounds(l: &PlanLayer, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
     (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
 }
 
+#[cfg(test)]
+mod adjust_tests;
 #[cfg(test)]
 mod blend_tests;
 #[cfg(test)]
