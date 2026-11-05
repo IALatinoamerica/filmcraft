@@ -319,13 +319,13 @@ fn seek_causes_follow_cache_history_and_precedence() {
     let before = gop_stats();
     assert_eq!(index_of(&c.frame(&s, 100_000).expect("first request")), 100);
     assert!(gop_stats().seeks_by_cut_in - before.seeks_by_cut_in >= 1);
-    let cause = |i| c.shared.state.lock().unwrap().seek_cause(i, decode_start(&s, i), s.pts(i));
+    let cause = |i| c.shared.state.lock().unwrap().seek_cause(&c.shared.frames.lock().unwrap(), i, decode_start(&s, i), s.pts(i));
     assert_eq!(cause(20), SeekCause::OutOfOrder);
     assert_eq!(index_of(&c.frame(&s, 20_000).expect("backwards")), 20);
     assert_eq!(cause(300), SeekCause::CutIn);
     assert_eq!(index_of(&c.frame(&s, 300_000).expect("far forward")), 300);
     {
-        let mut st = c.shared.state.lock().unwrap();
+        let mut st = c.shared.frames.lock().unwrap();
         st.release_frames(&c.shared.pool, || true);
         assert!(!st.used.contains(&300_000));
         assert!(st.evicted.contains(&300_000));
@@ -335,7 +335,7 @@ fn seek_causes_follow_cache_history_and_precedence() {
     assert_eq!(index_of(&c.frame(&s, 300_000).expect("evicted")), 300);
     {
         let mut st = c.shared.state.lock().unwrap();
-        assert!(!st.evicted.contains(&300_000));
+        assert!(!c.shared.frames.lock().unwrap().evicted.contains(&300_000));
         let released = st.release_decoder(&c.shared.pool);
         drop(st);
         drop(released);
@@ -348,15 +348,16 @@ fn seek_causes_follow_cache_history_and_precedence() {
     // Exercise the mutually overlapping causes without depending on global counters.
     let mut st = c.shared.state.lock().unwrap();
     st.fresh_decoder = true;
-    st.evicted.insert(20_000);
-    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::DecoderRecycled);
+    let mut frames = c.shared.frames.lock().unwrap();
+    frames.evicted.insert(20_000);
+    assert_eq!(st.seek_cause(&frames, 20, 0, 20_000), SeekCause::DecoderRecycled);
     st.had_decoder = false;
     st.next = usize::MAX;
-    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::EvictedFrame);
-    st.evicted.clear();
-    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::CutIn);
+    assert_eq!(st.seek_cause(&frames, 20, 0, 20_000), SeekCause::EvictedFrame);
+    frames.evicted.clear();
+    assert_eq!(st.seek_cause(&frames, 20, 0, 20_000), SeekCause::CutIn);
     st.fresh_decoder = false;
-    assert_eq!(st.seek_cause(20, 0, 20_000), SeekCause::Other);
+    assert_eq!(st.seek_cause(&frames, 20, 0, 20_000), SeekCause::Other);
 }
 
 #[test]
@@ -368,16 +369,16 @@ fn used_frames_count_each_decoded_picture_once() {
         let first = c.frame(&s, 5_000).expect("first");
         assert!(gop_stats().used_frames - before >= 1);
         assert!(Arc::ptr_eq(&first, &c.frame(&s, 5_000).expect("cached")));
-        assert_eq!(c.shared.state.lock().unwrap().used, BTreeSet::from([5_000]));
+        assert_eq!(c.shared.frames.lock().unwrap().used, BTreeSet::from([5_000]));
         let decoded = s.decodes.load(Ordering::Relaxed);
         {
-            let mut st = c.shared.state.lock().unwrap();
+            let mut st = c.shared.frames.lock().unwrap();
             // Newly decoded output at the same pts is a different picture, even without eviction.
             c.store(&mut st, 5_000, picture((5_000, false)).frame, false);
             assert!(!st.used.contains(&5_000));
         }
         c.frame(&s, 5_000).expect("replacement");
-        assert_eq!(c.shared.state.lock().unwrap().used, BTreeSet::from([5_000]));
+        assert_eq!(c.shared.frames.lock().unwrap().used, BTreeSet::from([5_000]));
         assert_eq!(s.decodes.load(Ordering::Relaxed), decoded, "the repeated request is cached");
         assert!(gop_stats().used_frames - before >= 2);
     }
@@ -421,6 +422,114 @@ fn index_of(f: &VideoFrame) -> usize {
     match &f.data {
         filmcraft_frame::PixelData::Rgba8(d) => d[0] as usize | (d[1] as usize) << 8,
         _ => unreachable!(),
+    }
+}
+
+#[test]
+fn concurrent_hits_finish_while_decode_is_blocked_and_mixed_requests_stay_correct() {
+    use std::sync::{Barrier, mpsc};
+
+    struct BlockingSamples {
+        inner: Samples,
+        entered: mpsc::Sender<()>,
+        resume: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    struct BlockingDec {
+        inner: Box<dyn VideoDecoder>,
+        entered: Option<mpsc::Sender<()>>,
+        resume: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    impl VideoDecoder for BlockingDec {
+        fn decode(&mut self, sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+            if pts == 64_000
+                && let Some(entered) = self.entered.take()
+            {
+                entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().expect("release blocked decoder");
+            }
+            self.inner.decode(sample, pts)
+        }
+        fn flush(&mut self) -> Vec<DecodedFrame> {
+            self.inner.flush()
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn name(&self) -> &str {
+            "blocking mock"
+        }
+    }
+    impl VideoSamples for BlockingSamples {
+        fn count(&self) -> usize {
+            self.inner.count()
+        }
+        fn pts(&self, i: usize) -> i64 {
+            self.inner.pts(i)
+        }
+        fn sync_before(&self, i: usize) -> usize {
+            self.inner.sync_before(i)
+        }
+        fn sample_at(&self, t: i64) -> Option<usize> {
+            self.inner.sample_at(t)
+        }
+        fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+            self.inner.read(i)
+        }
+        fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(BlockingDec { inner: self.inner.make_decoder()?, entered: Some(self.entered.clone()), resume: self.resume.clone() }))
+        }
+    }
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let s = Arc::new(BlockingSamples { inner: samples(200, 200, 8, false), entered: entered_tx, resume: Arc::new(Mutex::new(resume_rx)) });
+    let mut c = GopCache::new(None).with_rotation(1);
+    c.budget = MIN_FRAMES * 4; // Force eviction during the mixed requests below.
+    let c = Arc::new(c);
+    assert_eq!(index_of(&c.frame(s.as_ref(), 31_000).unwrap()), 31);
+    let (done_tx, done_rx) = mpsc::channel();
+    let mut threads = Vec::new();
+    {
+        let (c, s, done) = (c.clone(), s.clone(), done_tx.clone());
+        threads.push(std::thread::spawn(move || {
+            assert_eq!(index_of(&c.frame(s.as_ref(), 95_000).unwrap()), 95);
+            done.send(()).unwrap();
+        }));
+    }
+    entered_rx.recv_timeout(Duration::from_secs(2)).expect("decode reached the blocking sample");
+    assert!(matches!(c.shared.state.try_lock(), Err(TryLockError::WouldBlock)));
+
+    let start = Arc::new(Barrier::new(13));
+    let (hit_tx, hit_rx) = mpsc::channel();
+    for worker in 0..12 {
+        let (c, s, start, hit, done) = (c.clone(), s.clone(), start.clone(), hit_tx.clone(), done_tx.clone());
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            let first = if worker % 2 == 0 { worker / 2 } else { 95 };
+            assert_eq!(index_of(&c.frame(s.as_ref(), first as i64 * 1000).unwrap()), first);
+            if worker % 2 == 0 {
+                hit.send(first).unwrap();
+            }
+            for step in 0..32 {
+                let i = if step % 2 == 0 { first } else { (worker * 17 + step * 11) % 160 };
+                assert_eq!(index_of(&c.frame(s.as_ref(), i as i64 * 1000).unwrap()), i);
+            }
+            done.send(()).unwrap();
+        }));
+    }
+    start.wait();
+    // No decode can finish until we send resume. Even raw hits must finish their rotation
+    // and return using only the frame lock while the decoder lock remains held.
+    let hits: Result<BTreeSet<_>, _> = (0..6).map(|_| hit_rx.recv_timeout(Duration::from_secs(1))).collect();
+    let still_decoding = matches!(c.shared.state.try_lock(), Err(TryLockError::WouldBlock));
+    resume_tx.send(()).unwrap(); // Release even on a failed hit assertion.
+    assert_eq!(hits.expect("cache hits must finish before decode resumes"), (0..6).collect());
+    assert!(still_decoding);
+    for _ in 0..13 {
+        done_rx.recv_timeout(Duration::from_secs(2)).expect("concurrent frame requests must not deadlock");
+    }
+    for thread in threads {
+        thread.join().unwrap();
     }
 }
 
@@ -847,7 +956,7 @@ fn idle_caches_give_up_their_frames_beyond_the_shared_budget() {
     let decodes = b.decodes.load(Ordering::Relaxed);
     assert!((0..=5).all(|i| index_of(&cb.frame(&b, i * 1000).expect("cached")) as i64 == i));
     assert_eq!(b.decodes.load(Ordering::Relaxed), decodes, "the clip in use lost nothing");
-    let st = ca.shared.state.lock().unwrap();
+    let st = ca.shared.frames.lock().unwrap();
     assert_eq!((st.frames.len(), st.bytes), (4, 16));
     assert_eq!(st.frames.keys().next(), Some(&7_000));
     drop(st);
@@ -1128,8 +1237,8 @@ fn long_gop_continue_does_not_restart_for_the_next_frame() {
 fn rotation_waits_for_the_frames_requests_take() {
     let s = samples(60, 30, 0, false);
     let c = GopCache::new(None).with_rotation(1);
-    let raw = |c: &GopCache| c.shared.state.lock().unwrap().raw.iter().map(|p| p / 1000).collect::<Vec<_>>();
-    let cached = |c: &GopCache, i: i64| c.shared.state.lock().unwrap().frames.get(&(i * 1000)).cloned().expect("cached");
+    let raw = |c: &GopCache| c.shared.frames.lock().unwrap().raw.iter().map(|p| p / 1000).collect::<Vec<_>>();
+    let cached = |c: &GopCache, i: i64| c.shared.frames.lock().unwrap().frames.get(&(i * 1000)).cloned().expect("cached");
     let f5 = c.frame(&s, 5_000).expect("frame");
     assert_eq!(index_of(&f5), 5);
     // decoding up to frame 5 rotated none of the frames before it
@@ -1278,12 +1387,12 @@ fn raw_draft_frames_are_not_served_to_exact_requests() {
     }
     let resets = s.resets.load(Ordering::Relaxed);
     // finishing the raw frame kept its draft mark
-    assert!(c.shared.state.lock().unwrap().drafts.contains(&5_000));
+    assert!(c.shared.frames.lock().unwrap().drafts.contains(&5_000));
     // an exact request decodes frame 5 again and gets an exact, rotated one
     let f = c.frame(&s, 5_000).expect("frame");
     assert!(!is_draft(&f) && index_of(&f) == 5);
     assert_eq!(s.resets.load(Ordering::Relaxed), resets + 1);
-    assert!(!c.shared.state.lock().unwrap().drafts.contains(&5_000));
+    assert!(!c.shared.frames.lock().unwrap().drafts.contains(&5_000));
     // an exact even frame is served from the cache
     assert!(!is_draft(&c.frame(&s, 4_000).expect("frame")));
     assert_eq!(s.resets.load(Ordering::Relaxed), resets + 1);
@@ -1300,7 +1409,7 @@ fn evicting_raw_frames_keeps_the_cache_consistent() {
     for i in 0..n {
         assert_eq!(c.frame(&s, i * 1000).expect("frame").width, 1);
     }
-    let st = c.shared.state.lock().unwrap();
+    let st = c.shared.frames.lock().unwrap();
     assert!(st.frames.len() < n as usize, "some frames were evicted");
     assert!(st.raw.iter().chain(st.drafts.iter()).all(|p| st.frames.contains_key(p)), "no mark outlives its frame");
     assert_eq!(st.bytes, st.frames.values().map(|f| f.byte_size()).sum::<usize>());
@@ -1323,21 +1432,22 @@ fn release_idle_empties_idle_caches_and_leaves_one_in_use_alone() {
 
     // a cache another thread holds (it is decoding) keeps its frames and decoder
     let busy = c[2].shared.state.lock().unwrap();
-    let held_bytes = busy.bytes;
+    let held_bytes = c[2].shared.frames.lock().unwrap().bytes;
     pool.release_idle();
-    assert_eq!(busy.bytes, held_bytes);
-    assert!(busy.decoder.is_some() && !busy.frames.is_empty());
+    assert_eq!(c[2].shared.frames.lock().unwrap().bytes, held_bytes);
+    assert!(busy.decoder.is_some() && !c[2].shared.frames.lock().unwrap().frames.is_empty());
     drop(busy);
     for k in 0..2 {
         let st = c[k].shared.state.lock().unwrap();
-        assert!(st.frames.is_empty() && st.drafts.is_empty() && st.bytes == 0 && st.decoder.is_none() && st.spare.is_empty());
+        let frames = c[k].shared.frames.lock().unwrap();
+        assert!(frames.frames.is_empty() && frames.drafts.is_empty() && frames.bytes == 0 && st.decoder.is_none() && st.spare.is_empty());
     }
     assert_eq!(pool.bytes.load(Ordering::Relaxed), held_bytes, "only the busy cache still counts");
     assert_eq!(pool.decoders.load(Ordering::Relaxed), 1);
 
     // an emptied cache decodes again from its sync sample, and a second release is harmless
     assert_eq!(index_of(&c[0].frame(&s[0], 20_000).expect("frame")), 20);
-    assert_eq!(pool.bytes.load(Ordering::Relaxed), held_bytes + c[0].shared.state.lock().unwrap().bytes);
+    assert_eq!(pool.bytes.load(Ordering::Relaxed), held_bytes + c[0].shared.frames.lock().unwrap().bytes);
     // the cache that was in use is idle now: nothing is left, and a second release is harmless
     pool.release_idle();
     pool.release_idle();
