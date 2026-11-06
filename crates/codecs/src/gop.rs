@@ -17,6 +17,11 @@ use filmcraft_frame::{Region, VideoFrame};
 use crate::CodecError;
 use crate::video::VideoDecoder;
 
+/// Configured export decode lanes per source (default two, bounded to 1–16).
+pub fn decode_lane_limit() -> usize {
+    std::env::var("FILMCRAFT_DECODE_LANES").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 16)
+}
+
 /// Process-wide decode counters of every [`GopCache`] (benchmarks and diagnostics).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GopStats {
@@ -1653,7 +1658,7 @@ impl GopCache {
         if !filmcraft_media::cancel::export() || !self.shared.scheduled.load(Ordering::SeqCst) || self.shared.primary.intra.load(Ordering::SeqCst) {
             return self.shared.primary.clone();
         }
-        let limit = std::env::var("FILMCRAFT_DECODE_LANES").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 16);
+        let limit = decode_lane_limit();
         self.choose_lane_limit(s, i, want_pts, allow_extra, limit)
     }
 
