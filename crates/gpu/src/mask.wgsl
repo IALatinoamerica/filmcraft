@@ -111,3 +111,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         out_px[k] = o + (effected[k] - o) * acc;
     }
 }
+
+// Encoder-recorded opacity mask path: coverage stays on the device and is multiplied
+// into the working texture before Motion samples it.
+@compute @workgroup_size(8, 8)
+fn coverage(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= params.width || id.y >= params.height { return; }
+    let p = vec2<f32>(id.xy) + 0.5;
+    var acc = mode_start(masks[0].mode);
+    for (var i = 0u; i < params.count; i++) {
+        let m = masks[i];
+        acc = clamp(combine(m.mode, acc, mask_value(m, p)), 0.0, 1.0);
+    }
+    out_cov[id.y * params.width + id.x] = acc;
+}
+
+@group(0) @binding(7) var source: texture_2d<f32>;
+@group(0) @binding(8) var masked: texture_storage_2d<rgba32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn multiply(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(source);
+    if any(id.xy >= size) { return; }
+    let p = vec2<i32>(id.xy);
+    textureStore(masked, p, textureLoad(source, p, 0) * out_cov[id.y * size.x + id.x]);
+}

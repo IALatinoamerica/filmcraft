@@ -22,6 +22,7 @@ struct U {
     q3: vec4<f32>,   // gamut matrix row 1, tone-mapping source peak cd/m²
     q4: vec4<f32>,   // gamut matrix row 2, tone-mapping target peak cd/m²
     q5: vec4<f32>,   // desaturation luma weights, desaturation on
+    source: vec4<f32>, // masked Yuv8 CPU decode semantics (source draw only; default off)
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -166,6 +167,25 @@ fn managed(rgb: vec3<f32>) -> vec3<f32> {
         }
     }
     return c;
+}
+
+// Match the opaque Yuv8 CPU decode before source-space masking. Chroma belongs to
+// the integer 2x2 block; the transfer lookup rounds the clamped signal to 12 bits.
+fn masked_yuv8(p: vec2<f32>) -> vec4<f32> {
+    let ip = clamp(vec2<i32>(floor(p)), vec2(0), vec2<i32>(u.src.xy) - 1);
+    let cp = ip / 2;
+    let yc = round(textureLoad(tex0, ip, 0).r * 255.0);
+    let cb = round(textureLoad(tex1, cp, 0).r * 255.0);
+    let cr = round(textureLoad(tex2, cp, 0).r * 255.0);
+    let y = (yc - u.p1.x) / u.p1.y;
+    let b = (cb - u.p1.z) / u.p1.w;
+    let r = (cr - u.p1.z) / u.p1.w;
+    let kr = u.p2.x; let kb = u.p2.y; let kg = 1.0 - kr - kb;
+    let cr_r = 2.0 * (1.0 - kr); let cb_b = 2.0 * (1.0 - kb);
+    let cr_g = cr_r * kr / kg; let cb_g = cb_b * kb / kg;
+    let rgb = vec3(y + cr_r * r, y - cr_g * r - cb_g * b, y + cb_b * b);
+    let quantized = floor(clamp(rgb, vec3(0.0), vec3(1.0)) * 4095.0 + 0.5) / 4095.0;
+    return vec4(to_linear(quantized), 1.0);
 }
 
 // One linear premultiplied sample at source position p.
@@ -379,6 +399,7 @@ fn fs_fx_source(in: VOut) -> @location(0) vec4<f32> {
         case 3u: { s = vec2(size.y - p.y, p.x); }
         default: {}
     }
+    if u.source.x > 0.5 { return masked_yuv8(s); }
     return layer_color(s * u.p3.z);
 }
 

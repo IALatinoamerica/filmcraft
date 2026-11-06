@@ -312,6 +312,18 @@ mod tests {
     }
 
     #[test]
+    fn masked_camera_export_matches_render_sequence() {
+        let (p, seq, _, sources) = crate::tests::camera_project();
+        let mut renderer = ExportRenderer::new().expect("real GPU for masked camera export gate");
+        for effects in [true, false] {
+            let opts = RenderOptions { effects, ..Default::default() };
+            let cpu = filmcraft_render::render_sequence(&p, seq, Tick::ZERO, opts, &sources);
+            let gpu = renderer.render(&p, seq, Tick::ZERO, opts, &sources).expect("masked camera export");
+            assert_parity(&cpu, &gpu, &format!("masked camera export effects={effects}"));
+        }
+    }
+
+    #[test]
     fn solid_frame_matches_cpu() {
         let Some(mut r) = ExportRenderer::new() else {
             eprintln!("SKIPPED (gpu export parity): no adapter");

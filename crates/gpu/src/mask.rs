@@ -173,3 +173,126 @@ impl GpuMask {
         Some((cov, px))
     }
 }
+
+/// Opacity mask jobs share the caller's encoder: no submission, mapping or pixel packing.
+pub(crate) struct MaskStage {
+    coverage: wgpu::ComputePipeline,
+    multiply: wgpu::ComputePipeline,
+}
+
+pub(crate) struct MaskJob {
+    coverage: wgpu::BindGroup,
+    multiply: wgpu::BindGroup,
+    groups: (u32, u32),
+}
+
+impl MaskStage {
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("opacity-mask"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("mask.wgsl").into()),
+        });
+        let make = |entry| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("opacity-mask"),
+                layout: None,
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        Self { coverage: make("coverage"), multiply: make("multiply") }
+    }
+
+    pub(crate) fn fits(device: &wgpu::Device, size: (u32, u32)) -> bool {
+        let limits = device.limits();
+        let bytes = u64::from(size.0).checked_mul(u64::from(size.1)).and_then(|n| n.checked_mul(4));
+        bytes.is_some_and(|n| n > 0 && n <= u64::from(limits.max_storage_buffer_binding_size) && n <= limits.max_buffer_size)
+            && size.0.div_ceil(8) <= limits.max_compute_workgroups_per_dimension
+            && size.1.div_ceil(8) <= limits.max_compute_workgroups_per_dimension
+    }
+
+    pub(crate) fn job(
+        &self,
+        device: &wgpu::Device,
+        masks: &[FlatMask],
+        size: (u32, u32),
+        source: &wgpu::TextureView,
+        target: &wgpu::TextureView,
+    ) -> Option<MaskJob> {
+        use wgpu::util::DeviceExt;
+        let (w, h) = size;
+        let count = masks.iter().filter(|m| m.mode.index() != 0).count();
+        let cov_size = u64::from(w).checked_mul(u64::from(h))?.checked_mul(4)?;
+        let limits = device.limits();
+        if count == 0 || !Self::fits(device, size) {
+            return None;
+        }
+        let mut params = Vec::with_capacity(16);
+        for v in [w, h, u32::try_from(count).ok()?, 0] {
+            params.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut infos = Vec::new();
+        let mut pts = Vec::new();
+        for m in masks.iter().filter(|m| m.mode.index() != 0) {
+            let start = u32::try_from(pts.len() / 8).ok()?;
+            for p in &m.pts {
+                for v in p {
+                    pts.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            for v in [start, u32::try_from(m.pts.len()).ok()?, m.mode.index(), u32::from(m.inverted)] {
+                infos.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [m.feather, m.expansion, m.opacity, 0.0] {
+                infos.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        if pts.is_empty() {
+            pts.resize(8, 0);
+        }
+        if [infos.len(), pts.len()].iter().any(|n| *n as u64 > u64::from(limits.max_storage_buffer_binding_size) || *n as u64 > limits.max_buffer_size) {
+            return None;
+        }
+        let init = |contents: &[u8], usage| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("opacity-mask"), contents, usage });
+        let ub = init(&params, wgpu::BufferUsages::UNIFORM);
+        let mb = init(&infos, wgpu::BufferUsages::STORAGE);
+        let pb = init(&pts, wgpu::BufferUsages::STORAGE);
+        let cov = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("opacity-coverage"),
+            size: cov_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let coverage = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("opacity-coverage"),
+            layout: &self.coverage.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: mb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cov.as_entire_binding() },
+            ],
+        });
+        let multiply = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("opacity-multiply"),
+            layout: &self.multiply.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 6, resource: cov.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(source) },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(target) },
+            ],
+        });
+        Some(MaskJob { coverage, multiply, groups: (w.div_ceil(8), h.div_ceil(8)) })
+    }
+
+    pub(crate) fn record(&self, enc: &mut wgpu::CommandEncoder, job: &MaskJob) {
+        for (pipeline, bg) in [(&self.coverage, &job.coverage), (&self.multiply, &job.multiply)] {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("opacity-mask"), timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(job.groups.0, job.groups.1, 1);
+        }
+    }
+}

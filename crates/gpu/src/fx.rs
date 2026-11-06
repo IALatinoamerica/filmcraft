@@ -61,6 +61,7 @@ const OP_THREE_WAY: u32 = 36;
 type Target = (wgpu::Texture, wgpu::TextureView);
 
 pub(crate) struct FxStage {
+    masks: crate::mask::MaskStage,
     px: wgpu::ComputePipeline,
     run: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
@@ -88,6 +89,7 @@ pub(crate) struct FxJob {
     source_bg: wgpu::BindGroup,
     source_target: wgpu::TextureView,
     dispatches: Vec<Dispatch>,
+    mask_job: Option<crate::mask::MaskJob>,
     /// The texture holding the result.
     pub(crate) result: wgpu::TextureView,
     pub(crate) result_texture: wgpu::Texture,
@@ -427,6 +429,7 @@ impl FxStage {
             })
         };
         Self {
+            masks: crate::mask::MaskStage::new(device),
             px: compute("fx_px"),
             run: compute("fx_run"),
             bgl,
@@ -555,7 +558,16 @@ impl FxStage {
                 orig = None;
             }
         }
+        let mask_job = if fx.opacity_masks.is_empty() {
+            None
+        } else {
+            let dst = (cur + 1) % n;
+            let job = self.masks.job(device, &fx.opacity_masks, (w, h), views.get(cur)?, views.get(dst)?)?;
+            cur = dst;
+            Some(job)
+        };
         Some(FxJob {
+            mask_job,
             source_bg,
             source_target: views.first()?.clone(),
             dispatches,
@@ -584,14 +596,16 @@ impl FxStage {
             pass.set_bind_group(0, &job.source_bg, &[]);
             pass.draw(0..6, 0..1);
         }
-        if job.dispatches.is_empty() {
-            return;
+        if !job.dispatches.is_empty() {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fx"), timestamp_writes: None });
+            for d in &job.dispatches {
+                pass.set_pipeline(if d.run { &self.run } else { &self.px });
+                pass.set_bind_group(0, &d.bg, &[]);
+                pass.dispatch_workgroups(d.groups.0, d.groups.1, 1);
+            }
         }
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fx"), timestamp_writes: None });
-        for d in &job.dispatches {
-            pass.set_pipeline(if d.run { &self.run } else { &self.px });
-            pass.set_bind_group(0, &d.bg, &[]);
-            pass.dispatch_workgroups(d.groups.0, d.groups.1, 1);
+        if let Some(mask_job) = &job.mask_job {
+            self.masks.record(enc, mask_job);
         }
     }
 }
@@ -622,7 +636,7 @@ impl super::GpuCompositor {
             working: filmcraft_color::WorkingSpace::Rec709,
         };
         let ops: Option<Vec<FxOp>> = effects.iter().map(|e| FxOp::eval(e, &cx, w as usize, h as usize).filter(FxOp::gpu_ok)).collect();
-        let lfx = LayerFx { size, decimation: 1, turns: 0, ops: ops? };
+        let lfx = LayerFx { opacity_masks: Vec::new(), size, decimation: 1, turns: 0, ops: ops? };
         if !weight.opacity.is_finite()
             || !weight.px_scale.is_finite()
             || ![weight.matrix.a, weight.matrix.b, weight.matrix.c, weight.matrix.d, weight.matrix.e, weight.matrix.f]

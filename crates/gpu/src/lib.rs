@@ -623,6 +623,10 @@ impl GpuCompositor {
         // Effect sources use the working pixel center, avoiding interpolated vertex coordinates.
         su[26] = n as f32;
         su[27] = (fx.turns % 4) as f32;
+        if !fx.opacity_masks.is_empty() && matches!(frame.data, PixelData::Yuv8 { chroma: Chroma::C420, alpha: None, .. }) {
+            su[52] = 1.0; // CPU decode semantics, only for the masked Yuv8 source draw
+            su[14] = 1.0;
+        }
         su
     }
 
@@ -702,7 +706,7 @@ impl GpuCompositor {
         ];
         let mut u = [0.0; UNIFORM_FLOATS];
         u[..28].copy_from_slice(&base);
-        u[28..].copy_from_slice(&q);
+        u[28..52].copy_from_slice(&q);
         u
     }
 
@@ -765,13 +769,17 @@ impl GpuCompositor {
             .iter()
             .map(|l| {
                 let lfx = l.fx.as_ref()?;
-                if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
+                if self.fx.is_some()
+                    && lfx.size.0.max(lfx.size.1) <= max_side
+                    && (lfx.opacity_masks.is_empty() || crate::mask::MaskStage::fits(&self.device, lfx.size))
+                {
                     return None;
                 }
                 let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
                 Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend))
             })
             .collect();
+        let masked_sampling: Vec<bool> = layers.iter().map(|l| l.fx.as_ref().is_some_and(|fx| !fx.opacity_masks.is_empty())).collect();
         let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
         let layers = resolved;
         let keys: Vec<(usize, u32, u32)> = layers
@@ -792,7 +800,7 @@ impl GpuCompositor {
         if let Some(f) = self.fx.as_mut() {
             f.begin_frame();
         }
-        for (l, k) in layers.iter().zip(&keys) {
+        for (i, (l, k)) in layers.iter().zip(&keys).enumerate() {
             // (every frame was just uploaded; a missing upload draws transparent texels)
             let src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
                 kind: 1,
@@ -831,7 +839,7 @@ impl GpuCompositor {
                 None => None,
             };
             // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
-            let (u, tex) = match &job {
+            let (mut u, tex) = match &job {
                 Some(j) => {
                     let s =
                         SrcInfo { kind: 1, code_scale: 1.0, code_levels: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color, input: None };
@@ -855,6 +863,9 @@ impl GpuCompositor {
                     (Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), views)
                 }
             };
+            if masked_sampling.get(i).copied().unwrap_or(false) {
+                u[14] = 1.0; // CPU Motion: one bilinear tap, including device-stage fallback
+            }
             jobs.push(job);
             let buf = self.uniform_buffer(&u);
             let mut entries = vec![
@@ -1231,8 +1242,8 @@ struct SrcInfo {
     input: Option<filmcraft_color::GpuInputParams>,
 }
 
-/// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
-const UNIFORM_FLOATS: usize = 52;
+/// Floats in a layer's uniform block (`U` in `composite.wgsl`: 14 vec4).
+const UNIFORM_FLOATS: usize = 56;
 
 /// Poll a future once: wgpu's native error scopes resolve immediately. `None` if it is still
 /// pending (then the caller assumes the worst).

@@ -696,3 +696,312 @@ fn accumulator_readback_retires_rejected_native_map() {
         "cleanup attempted to unmap an already rejected mapping"
     );
 }
+
+pub(super) fn camera_circle() -> filmcraft_project::Mask {
+    let mut mask =
+        filmcraft_project::Mask::new("camera", filmcraft_project::MaskPath::ellipse(Vec2::new(960.0, 560.0), Vec2::new(427.118644068, 427.118644068)));
+    mask.feather.value = filmcraft_project::ParamValue::Float(1.0);
+    mask
+}
+
+pub(super) struct CameraSource {
+    pub generator: filmcraft_media::generators::GeneratorSource,
+    pub frame: Arc<VideoFrame>,
+    pub turns: u8,
+}
+
+impl filmcraft_media::MediaSource for CameraSource {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        filmcraft_media::MediaSource::info(&self.generator)
+    }
+    fn video_frame(&self, _: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        Ok(Arc::new(self.frame.rotated(self.turns)))
+    }
+    fn video_frame_unturned(&self, _: filmcraft_media::FrameRequest) -> filmcraft_media::Result<(Arc<VideoFrame>, u8)> {
+        Ok((self.frame.clone(), self.turns))
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        filmcraft_media::MediaSource::audio(&self.generator, start, frames, rate)
+    }
+}
+
+pub(super) fn camera_source(frame: Arc<VideoFrame>, turns: u8) -> Arc<CameraSource> {
+    Arc::new(CameraSource {
+        generator: filmcraft_media::generators::GeneratorSource::new(
+            filmcraft_media::Generator::ColorMatte { color: [0.2, 0.4, 0.6, 1.0] },
+            1920,
+            1080,
+            filmcraft_time::FrameRate::FPS_60,
+            filmcraft_time::Tick(filmcraft_time::TICKS_PER_SECOND),
+        ),
+        frame,
+        turns,
+    })
+}
+
+pub(super) fn camera_frame() -> Arc<VideoFrame> {
+    let mut f = (*yuv_frame(1920, 1080)).clone();
+    // Adjacent chroma blocks vary strongly: bilinear chroma reconstruction or an extra
+    // Motion prefilter must not accidentally pass on a smooth/constant test picture.
+    if let PixelData::Yuv8 { planes, .. } = &mut f.data {
+        planes[1] = Arc::new((0..960 * 540).map(|i| [64, 192, 96, 160][(i + i / 960) % 4]).collect());
+        planes[2] = Arc::new((0..960 * 540).map(|i| [192, 64, 160, 96][(i * 3 + i / 960) % 4]).collect());
+    }
+    Arc::new(f)
+}
+
+pub(super) fn camera_project() -> (filmcraft_project::Project, filmcraft_project::ItemId, filmcraft_project::ItemId, filmcraft_render::SourceMap) {
+    use filmcraft_media::MediaSource;
+    use filmcraft_project::{ItemKind, Label, MediaClip, MediaRef, ParamValue, Project, SequenceSettings, TrackKind};
+    use filmcraft_time::{FrameRate, Tick, TimeRange};
+    let mut p = Project::new("masked camera");
+    let source = camera_source(camera_frame(), 0);
+    let media = p.add_item(
+        "camera",
+        Label::Iris,
+        ItemKind::Media(Box::new(MediaClip {
+            media: MediaRef::Generator(source.generator.generator.clone()),
+            info: source.info().clone(),
+            interpret: Default::default(),
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            offline: false,
+            proxy: None,
+            identity: None,
+        })),
+        None,
+    );
+    let seq = p.new_sequence("camera", SequenceSettings { width: 1920, height: 1080, frame_rate: FrameRate::FPS_60, ..Default::default() }, 1, 0, None);
+    let mut clip =
+        p.make_track_item(media, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, FrameRate::FPS_60.tick_of(30)), FrameRate::FPS_60).unwrap();
+    let motion = clip.effect_mut("motion").unwrap();
+    for (id, value) in [
+        ("anchor", ParamValue::Vec2(Vec2::new(960.0, 560.0))),
+        ("position", ParamValue::Vec2(Vec2::new(1705.0, 856.0))),
+        ("scale", ParamValue::Float(51.5079365079)),
+        ("scale_width", ParamValue::Float(100.0)),
+        ("uniform_scale", ParamValue::Bool(true)),
+        ("rotation", ParamValue::Float(0.0)),
+    ] {
+        motion.param_mut(id).unwrap().value = value;
+    }
+    clip.effect_mut("opacity").unwrap().masks.push(camera_circle());
+    p.sequence_mut(seq).unwrap().video_tracks[0].items.push(clip);
+    let mut sources = filmcraft_render::SourceMap::default();
+    sources.0.insert(media, source);
+    (p, seq, media, sources)
+}
+
+#[test]
+fn masked_camera_coverage_and_texture_multiply() {
+    let (dev, q) = device().expect("real GPU for masked camera gate");
+    let mut c = GpuCompositor::new(&dev, &q);
+    let masks = filmcraft_render::mask::prepare(&[camera_circle()], filmcraft_time::Tick::ZERO, 1.0);
+    let cpu_cov = filmcraft_render::mask::coverage(&masks, 1920, 1080).unwrap();
+    let gpu_cov = GpuMask::new(&dev, &q).coverage(&masks, 1920, 1080).unwrap();
+    let coverage_error = cpu_cov.iter().zip(&gpu_cov).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let pixels: Vec<f32> = (0..1920 * 1080).flat_map(|i| [0.25, 0.5, if i % 2 == 0 { 0.125 } else { 0.75 }, 1.0]).collect();
+    let frame = VideoFrame::rgba_f32(1920, 1080, pixels);
+    let fx = filmcraft_render::plan::LayerFx { size: (1920, 1080), decimation: 1, turns: 0, ops: vec![], opacity_masks: masks };
+    let reference = filmcraft_render::plan::effect_image(&frame, &fx);
+    let (_, _, gpu) = c.effect_image(&frame, &fx).expect("recorded coverage and multiply");
+    let multiply_error = reference.px.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    eprintln!("masked camera: coverage max={coverage_error:e}, texture multiply max={multiply_error:e}");
+    assert!(coverage_error < 2e-4 && multiply_error < 2e-4);
+}
+
+#[test]
+fn masked_yuv8_isolated_conversion_matches_cpu() {
+    let (dev, q) = device().expect("real GPU for masked Yuv8 gate");
+    let mut c = GpuCompositor::new(&dev, &q);
+    let mut mask = camera_circle();
+    mask.path.value = filmcraft_project::ParamValue::Path(filmcraft_project::MaskPath::ellipse(Vec2::new(128.0, 16.0), Vec2::new(1000.0, 1000.0)));
+    let fx = filmcraft_render::plan::LayerFx {
+        size: (256, 32),
+        decimation: 1,
+        turns: 0,
+        ops: vec![],
+        opacity_masks: filmcraft_render::mask::prepare(&[mask], filmcraft_time::Tick::ZERO, 1.0),
+    };
+    for range in [Range::Limited, Range::Full] {
+        for matrix in [Matrix::Bt709, Matrix::Bt601, Matrix::Bt2020Ncl] {
+            let mut frame = (*yuv_frame(256, 32)).clone();
+            frame.color.range = range;
+            frame.color.matrix = matrix;
+            if let PixelData::Yuv8 { planes, .. } = &mut frame.data {
+                planes[0] = Arc::new((0..256 * 32).map(|i| (i % 256) as u8).collect());
+                planes[1] = Arc::new((0..128 * 16).map(|i| ((i * 73) % 256) as u8).collect());
+                planes[2] = Arc::new((0..128 * 16).map(|i| ((i * 157) % 256) as u8).collect());
+            }
+            let cpu = filmcraft_render::plan::effect_image(&frame, &fx).over_black_rgba8();
+            let (_, _, px) = c.effect_image(&frame, &fx).unwrap();
+            let gpu = filmcraft_render::Image { w: 256, h: 32, px }.over_black_rgba8();
+            let max = cpu.iter().zip(&gpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            eprintln!("masked Yuv8 isolated {range:?} {matrix:?}: max code difference={max}");
+            assert!(max <= 1);
+            let key = c.upload(&frame, None);
+            let src = c.src_info(&frame, key).unwrap();
+            assert_eq!(GpuCompositor::uniforms(&src, &Affine::IDENTITY, 1.0, Blend::Normal, fx.size)[52], 0.0);
+            let mut unmasked = fx.clone();
+            unmasked.opacity_masks.clear();
+            assert_eq!(GpuCompositor::fx_source_uniforms(&src, &frame, &unmasked)[52], 0.0);
+            assert_eq!(GpuCompositor::fx_source_uniforms(&src, &frame, &fx)[52], 1.0);
+        }
+    }
+}
+
+#[test]
+fn masked_camera_plan_and_device_fallback_match_render_sequence() {
+    use filmcraft_render::{RenderOptions, plan::plan_frame, render_sequence};
+    let (dev, q) = device().expect("real GPU for masked camera parity");
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (p, seq, _, sources) = camera_project();
+    for effects in [true, false] {
+        let opts = RenderOptions { effects, ..Default::default() };
+        let plan = plan_frame(&p, seq, filmcraft_time::Tick::ZERO, opts, &sources);
+        let FramePlan::Layers { layers, .. } = &plan else { panic!("direct camera layers") };
+        assert_eq!(layers.len(), 1);
+        assert!(matches!(layers[0].frame.data, PixelData::Yuv8 { .. }));
+        let fx = layers[0].fx.as_ref().unwrap();
+        assert!(fx.ops.is_empty());
+        assert_eq!(fx.opacity_masks.len(), 1);
+        assert_eq!((fx.size, fx.decimation, fx.turns), ((1920, 1080), 1, 0));
+        let prep = prepare(&plan);
+        assert!(prep.layers.iter().all(Option::is_none), "Yuv8 needs no float packing");
+        let cpu = render_sequence(&p, seq, filmcraft_time::Tick::ZERO, opts, &sources);
+        assert_eq!(execute_cpu(&plan).px, cpu.px, "plan CPU mask order");
+        for fallback in [false, true] {
+            let stage = if fallback { c.fx.take() } else { None };
+            c.composite_prepared(&plan, Some(&prep));
+            let (_, _, px) = c.read_output().unwrap();
+            let reference = cpu.over_black_rgba8();
+            let mut d: Vec<u32> = reference
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(px.as_chunks::<4>().0)
+                .map(|(a, b)| (0..3).map(|k| u32::from(a[k].abs_diff(b[k]))).max().unwrap())
+                .collect();
+            d.sort_unstable();
+            let p99 = d[d.len() * 99 / 100];
+            let mean = d.iter().sum::<u32>() as f64 / d.len() as f64;
+            eprintln!("masked camera effects={effects} device fallback={fallback}: p99={p99}, mean={mean:.6}");
+            assert!(p99 <= 6 && mean < 1.5);
+            if fallback {
+                c.fx = stage;
+            }
+        }
+    }
+}
+
+#[test]
+fn masked_camera_ineligible_cases_keep_cpu_layer() {
+    use filmcraft_project::{MaskMode, MaskPath, ParamValue, TimeInterpolation};
+    use filmcraft_render::{RenderOptions, plan::plan_frame};
+    use filmcraft_time::Tick;
+    let (base, seq, media, sources) = camera_project();
+    for case in [
+        "ellipse",
+        "polygon",
+        "open",
+        "handle",
+        "inverted",
+        "mode",
+        "feather",
+        "expansion",
+        "opacity",
+        "second mask",
+        "path key",
+        "feather key",
+        "expansion key",
+        "opacity key",
+        "standard effect",
+        "rotation",
+        "negative",
+        "minification",
+        "output scale",
+        "chroma",
+        "alpha",
+        "rgba",
+        "size",
+        "turns",
+        "managed",
+        "interpolation",
+    ] {
+        let mut p = base.clone();
+        let mut map = filmcraft_render::SourceMap::default();
+        map.0.clone_from(&sources.0);
+        let clip = &mut p.sequence_mut(seq).unwrap().video_tracks[0].items[0];
+        let mask = &mut clip.effect_mut("opacity").unwrap().masks[0];
+        let mut opts = RenderOptions::default();
+        let mut frame = (*sources.0[&media].video_frame(filmcraft_media::FrameRequest { time: Tick::ZERO, scale: 1.0 }).unwrap()).clone();
+        let mut turns = 0;
+        match case {
+            "ellipse" => mask.path.value = ParamValue::Path(MaskPath::ellipse(Vec2::new(960.0, 560.0), Vec2::new(427.0, 400.0))),
+            "polygon" => mask.path.value = ParamValue::Path(MaskPath::rect(500.0, 100.0, 1300.0, 900.0)),
+            "open" => {
+                if let ParamValue::Path(path) = &mut mask.path.value {
+                    path.closed = false;
+                }
+            }
+            "handle" => {
+                if let ParamValue::Path(path) = &mut mask.path.value {
+                    path.vertices[0].t_out.x += 1.0;
+                }
+            }
+            "inverted" => mask.inverted = true,
+            "mode" => mask.mode = MaskMode::Subtract,
+            "feather" => mask.feather.value = ParamValue::Float(2.0),
+            "expansion" => mask.expansion.value = ParamValue::Float(1.0),
+            "opacity" => mask.opacity.value = ParamValue::Float(50.0),
+            "second mask" => clip.effect_mut("opacity").unwrap().masks.push(camera_circle()),
+            "path key" => mask.path.toggle_animation(Tick::ZERO),
+            "feather key" => mask.feather.toggle_animation(Tick::ZERO),
+            "expansion key" => mask.expansion.toggle_animation(Tick::ZERO),
+            "opacity key" => mask.opacity.toggle_animation(Tick::ZERO),
+            "standard effect" => {
+                clip.effects.push(filmcraft_project::find_effect("black_white").unwrap().instance());
+                opts.effects = false;
+            }
+            "rotation" => clip.effect_mut("motion").unwrap().param_mut("rotation").unwrap().value = ParamValue::Float(5.0),
+            "negative" => clip.effect_mut("motion").unwrap().param_mut("scale").unwrap().value = ParamValue::Float(-60.0),
+            "minification" => clip.effect_mut("motion").unwrap().param_mut("scale").unwrap().value = ParamValue::Float(50.0),
+            "output scale" => opts.scale = 0.5,
+            "chroma" => {
+                if let PixelData::Yuv8 { chroma, .. } = &mut frame.data {
+                    *chroma = Chroma::C444;
+                }
+            }
+            "alpha" => {
+                if let PixelData::Yuv8 { alpha, .. } = &mut frame.data {
+                    *alpha = Some(Arc::new(vec![255; 1920 * 1080]));
+                }
+            }
+            "rgba" => frame = VideoFrame::rgba8(1920, 1080, vec![255; 1920 * 1080 * 4]),
+            "size" => frame = (*yuv_frame(960, 540)).clone(),
+            "turns" => turns = 2,
+            "managed" => {
+                frame.color.transfer = Transfer::Pq;
+                frame.color.primaries = filmcraft_color::Primaries::Bt2020;
+            }
+            "interpolation" => {
+                clip.speed = 0.7;
+                clip.time_interpolation = TimeInterpolation::FrameBlending;
+            }
+            _ => unreachable!(),
+        }
+        if case == "chroma" {
+            // Valid 4:4:4 planes, still deliberately ineligible.
+            if let PixelData::Yuv8 { planes, .. } = &mut frame.data {
+                planes[1] = Arc::new(vec![90; 1920 * 1080]);
+                planes[2] = Arc::new(vec![160; 1920 * 1080]);
+            }
+        }
+        map.0.insert(media, camera_source(Arc::new(frame), turns));
+        let plan = plan_frame(&p, seq, filmcraft_time::FrameRate::FPS_60.tick_of(1), opts, &map);
+        let FramePlan::Layers { layers, .. } = plan else { panic!("{case}: layer fallback") };
+        assert_eq!(layers.len(), 1, "{case}");
+        assert!(layers[0].fx.is_none() && matches!(layers[0].frame.data, PixelData::RgbaF32(_)), "{case}: must retain CPU layer fallback");
+    }
+}

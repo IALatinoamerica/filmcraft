@@ -61,6 +61,8 @@ pub struct LayerFx {
     /// [`MediaSource::video_frame_unturned`]: filmcraft_media::MediaSource::video_frame_unturned
     pub turns: u8,
     pub ops: Vec<FxOp>,
+    /// Applied in working pixels after standard effects, before Motion.
+    pub opacity_masks: Vec<crate::mask::FlatMask>,
 }
 
 impl PlanLayer {
@@ -227,12 +229,39 @@ fn simple_transition(id: &str) -> bool {
     matches!(id, "cross_dissolve" | "dip_to_black" | "dip_to_white")
 }
 
-/// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
+/// Only the static canonical circle is admitted; other opacity masks stay on the CPU.
+fn gpu_opacity_circle(item: &TrackItem) -> Option<&filmcraft_project::Mask> {
+    use filmcraft_geom::Vec2;
+    use filmcraft_project::{MaskMode, MaskPath, ParamValue};
+    let op = item.effect("opacity").filter(|e| e.enabled)?;
+    let [mask] = op.masks.as_slice() else { return None };
+    if mask.mode != MaskMode::Add
+        || mask.inverted
+        || mask.is_animated()
+        || mask.feather.f64_at(Tick::ZERO) != 1.0
+        || mask.expansion.f64_at(Tick::ZERO) != 0.0
+        || mask.opacity.f64_at(Tick::ZERO) != 100.0
+        || item.effects.iter().any(|e| e.enabled && !e.def().is_some_and(|d| d.intrinsic))
+    {
+        return None;
+    }
+    let ParamValue::Path(path) = &mask.path.value else { return None };
+    let [top, right, bottom, left] = path.vertices.as_slice() else { return None };
+    let center = Vec2::new((left.p.x + right.p.x) * 0.5, (top.p.y + bottom.p.y) * 0.5);
+    let radius = (right.p.x - left.p.x) * 0.5;
+    if !path.closed || !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let canonical = MaskPath::ellipse(center, Vec2::new(radius, radius));
+    path.components().iter().zip(canonical.components()).all(|(a, b)| a.is_finite() && (a - b).abs() < 1e-6).then_some(mask)
+}
+
+/// The standard effects of a media clip if the GPU can draw it (any blend mode, supported opacity masks,
 /// every enabled standard effect unmasked and with a GPU implementation; empty without effects or
 /// with effects off). None: the clip is rendered on the CPU.
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
-    if !is_media || item.has_opacity_masks() {
+    if !is_media || (item.has_opacity_masks() && gpu_opacity_circle(item).is_none()) {
         return None;
     }
     if !opts.effects {
@@ -583,9 +612,23 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
         // in-between frames (Frame Blending / Optical Flow on speed-changed or rate-conformed clips)
         let pipe = &seq.settings.color;
         let input = if crate::colorman::needs_management(pipe, cs, &frame) { crate::colorman::gpu_input(project, item.item, pipe, cs, &frame) } else { None };
-        let plain = (input.is_some() || !crate::colorman::needs_management(pipe, cs, &frame))
+        let masked = item.has_opacity_masks();
+        let masked_ok = !masked
+            || (opts.scale == 1.0
+                && turns == 0
+                && size == (frame.width, frame.height)
+                && matches!(frame.data, filmcraft_frame::PixelData::Yuv8 { chroma: filmcraft_frame::Chroma::C420, alpha: None, .. })
+                && !crate::colorman::needs_management(pipe, cs, &frame)
+                && [motion.a, motion.b, motion.c, motion.d, motion.e, motion.f].iter().all(|v| v.is_finite())
+                && motion.b == 0.0
+                && motion.c == 0.0
+                && motion.a > 0.5
+                && motion.d > 0.5
+                && crate::decimation(frame.width as f32, size.0 as f32 * want) == 1);
+        let plain = masked_ok
+            && (input.is_some() || !crate::colorman::needs_management(pipe, cs, &frame))
             && crate::media_interpolation(item, t, &src, seq.settings.frame_rate).is_none();
-        if plain && !chain.is_empty() {
+        if plain && (!chain.is_empty() || masked) {
             // GPU effect stage: the working image the CPU would decode (`base_layer`), the
             // effects evaluated for it, placed as `item_layer` places it
             let (fw, fh) = upright(&frame);
@@ -609,7 +652,9 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
                 let m = Affine::scale(opts.scale as f64, opts.scale as f64)
                     .then_apply(&motion)
                     .then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
-                let fx = LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, turns, ops };
+                let opacity_masks =
+                    if masked { item.effect("opacity").map_or_else(Vec::new, |e| crate::mask::prepare(&e.masks, mt, px_scale)) } else { Vec::new() };
+                let fx = LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, turns, ops, opacity_masks };
                 out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)), input });
                 return;
             }
@@ -665,6 +710,9 @@ pub fn effect_image_with(frame: &VideoFrame, fx: &LayerFx, input: Option<&filmcr
     let mut img = turned(linear_image(frame, fx.decimation.max(1) as usize, input), fx.turns);
     for op in &fx.ops {
         op.apply(&mut img);
+    }
+    if let Some(cov) = crate::mask::coverage(&fx.opacity_masks, img.w, img.h) {
+        crate::mask::scale_by(&mut img, &cov);
     }
     img
 }
