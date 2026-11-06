@@ -208,7 +208,7 @@ impl MaskStage {
     pub(crate) fn fits(device: &wgpu::Device, size: (u32, u32)) -> bool {
         let limits = device.limits();
         let bytes = u64::from(size.0).checked_mul(u64::from(size.1)).and_then(|n| n.checked_mul(4));
-        bytes.is_some_and(|n| n > 0 && n <= u64::from(limits.max_storage_buffer_binding_size) && n <= limits.max_buffer_size)
+        bytes.is_some_and(|n| n > 0 && n <= limits.max_storage_buffer_binding_size && n <= limits.max_buffer_size)
             && size.0.div_ceil(8) <= limits.max_compute_workgroups_per_dimension
             && size.1.div_ceil(8) <= limits.max_compute_workgroups_per_dimension
     }
@@ -252,7 +252,7 @@ impl MaskStage {
         if pts.is_empty() {
             pts.resize(8, 0);
         }
-        if [infos.len(), pts.len()].iter().any(|n| *n as u64 > u64::from(limits.max_storage_buffer_binding_size) || *n as u64 > limits.max_buffer_size) {
+        if [infos.len(), pts.len()].iter().any(|n| *n as u64 > limits.max_storage_buffer_binding_size || *n as u64 > limits.max_buffer_size) {
             return None;
         }
         let init = |contents: &[u8], usage| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("opacity-mask"), contents, usage });
