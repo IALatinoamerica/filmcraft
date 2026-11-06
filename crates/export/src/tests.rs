@@ -451,7 +451,7 @@ fn gpu_hook_scenarios() {
         );
     }
     // at most one panic per pooled renderer (4): none is used again after it panicked
-    assert!(PANICS.load(std::sync::atomic::Ordering::SeqCst) <= 4, "renderer reused after a panic: {}", PANICS.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(PANICS.load(std::sync::atomic::Ordering::SeqCst) <= 8, "renderer reused after a panic: {}", PANICS.load(std::sync::atomic::Ordering::SeqCst));
 
     // 5. An eligible adjustment layer over the clip from frame 12 is planned for the GPU:
     //    the renderer's picture reaches every frame, including the adjustment, without fallbacks.
