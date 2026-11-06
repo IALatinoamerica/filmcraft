@@ -225,6 +225,9 @@ pub trait MediaSource: Send + Sync {
     /// Earliest source time still needed in the current export window, including outstanding
     /// prefetches. Pinned sources may evict only frames before it. Default: no-op.
     fn set_export_position(&self, _time: Tick) {}
+    /// Scheduled-work membership and completed output-frame progress for export-only lanes.
+    /// Published before prefetch launch, refreshed while busy, and cleared after join.
+    fn set_export_work(&self, _scheduled: bool, _output_frame: i64) {}
     /// Like [`video_frame`](Self::video_frame), but a source may leave the container's display
     /// rotation to the caller: the frame comes with the clockwise quarter turns still to apply
     /// to it (0: upright, as `video_frame` returns it).

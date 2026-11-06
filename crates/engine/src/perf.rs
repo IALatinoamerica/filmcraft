@@ -16,6 +16,7 @@ pub fn decode_json() -> Value {
         "cacheMisses": g.misses,
         "cacheHitRate": g.hit_rate(),
         "seeks": g.seeks,
+        "lanes": { "created": g.lanes_created, "peakPerSource": g.lanes_peak_per_source, "released": g.lanes_released },
         "samplesDecoded": g.decoded,
         "samplesSkipped": g.skipped,
         "draftFrames": g.draft,
@@ -151,6 +152,9 @@ mod tests {
             "planesReused",
         ] {
             assert!(v["decode"][k].is_number(), "decode.{k} in {v}");
+        }
+        for k in ["created", "peakPerSource", "released"] {
+            assert!(v["decode"]["lanes"][k].is_number(), "decode.lanes.{k} in {v}");
         }
         for k in ["cutIn", "evictedFrame", "decoderRecycled", "outOfOrder", "other"] {
             assert!(v["decode"]["seeksBy"][k].is_number(), "decode.seeksBy.{k} in {v}");

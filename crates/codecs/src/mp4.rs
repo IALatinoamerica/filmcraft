@@ -515,6 +515,10 @@ impl MediaSource for Mp4Source {
         self.video.set_export_pinned(pinned);
     }
 
+    fn set_export_work(&self, scheduled: bool, output_frame: i64) {
+        self.video.set_export_work(scheduled, output_frame);
+    }
+
     fn set_export_position(&self, time: Tick) {
         let Some(ti) = self.vtrack else { return };
         let Some(track) = self.file.tracks.get(ti) else { return };

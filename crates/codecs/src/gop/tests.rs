@@ -1775,3 +1775,706 @@ fn release_idle_empties_idle_caches_and_leaves_one_in_use_alone() {
     assert_eq!(pool.bytes.load(Ordering::Relaxed), 0);
     assert_eq!(pool.decoders.load(Ordering::Relaxed), 0);
 }
+
+// Bounded, channel-controlled sessions shared by the lane concurrency tests.
+type LaneGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+struct LaneSamples {
+    inner: Box<dyn VideoSamples + Send>,
+    gates: Arc<Mutex<BTreeMap<(usize, i64), LaneGate>>>,
+    fed: Arc<Mutex<Vec<(usize, i64)>>>,
+    factories: AtomicUsize,
+    fail_factory: AtomicBool,
+    fail_pts: Arc<AtomicI64>,
+}
+struct LaneDec {
+    inner: Box<dyn VideoDecoder>,
+    id: usize,
+    gates: Arc<Mutex<BTreeMap<(usize, i64), LaneGate>>>,
+    fed: Arc<Mutex<Vec<(usize, i64)>>>,
+    fail_pts: Arc<AtomicI64>,
+}
+impl VideoDecoder for LaneDec {
+    fn decode(&mut self, data: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+        let gate = self.gates.lock().unwrap().remove(&(self.id, pts));
+        if let Some((entered, resume)) = gate {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).expect("release lane mock");
+        }
+        if self.fail_pts.load(Ordering::SeqCst) == pts {
+            return Err(CodecError::Decode("lane-local failure".into()));
+        }
+        self.fed.lock().unwrap().push((self.id, pts));
+        self.inner.decode(data, pts)
+    }
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        self.inner.flush()
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn name(&self) -> &str {
+        "lane mock"
+    }
+    fn intra_only(&self) -> bool {
+        self.inner.intra_only()
+    }
+    fn is_random_access(&self, data: &[u8]) -> Option<bool> {
+        self.inner.is_random_access(data)
+    }
+    fn is_disposable(&self, data: &[u8]) -> bool {
+        self.inner.is_disposable(data)
+    }
+    fn set_draft(&mut self, on: bool) {
+        self.inner.set_draft(on);
+    }
+    fn set_output_floor(&mut self, pts: Option<i64>) {
+        self.inner.set_output_floor(pts);
+    }
+    fn thread_limited(&self) -> bool {
+        self.inner.thread_limited()
+    }
+}
+impl VideoSamples for LaneSamples {
+    fn count(&self) -> usize {
+        self.inner.count()
+    }
+    fn pts(&self, i: usize) -> i64 {
+        self.inner.pts(i)
+    }
+    fn sync_before(&self, i: usize) -> usize {
+        self.inner.sync_before(i)
+    }
+    fn sample_at(&self, t: i64) -> Option<usize> {
+        self.inner.sample_at(t)
+    }
+    fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+        self.inner.read(i)
+    }
+    fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+        if self.fail_factory.load(Ordering::SeqCst) {
+            return Err(CodecError::Decode("factory failure".into()));
+        }
+        Ok(Box::new(LaneDec {
+            inner: self.inner.make_decoder()?,
+            id: self.factories.fetch_add(1, Ordering::SeqCst),
+            gates: self.gates.clone(),
+            fed: self.fed.clone(),
+            fail_pts: self.fail_pts.clone(),
+        }))
+    }
+}
+impl LaneSamples {
+    fn gate(&self, lane: usize, pts: i64) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, seen) = std::sync::mpsc::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        self.gates.lock().unwrap().insert((lane, pts), (entered, wait));
+        (seen, resume)
+    }
+}
+fn lane_fixture() -> (Arc<GopCache>, Arc<LaneSamples>) {
+    lane_fixture_from(FloorSamples::new(samples(400, 200, 8, false)))
+}
+fn lane_fixture_from(inner: impl VideoSamples + Send + 'static) -> (Arc<GopCache>, Arc<LaneSamples>) {
+    let s = Arc::new(LaneSamples {
+        inner: Box::new(inner),
+        gates: Default::default(),
+        fed: Default::default(),
+        factories: AtomicUsize::new(0),
+        fail_factory: AtomicBool::new(false),
+        fail_pts: Arc::new(AtomicI64::new(-1)),
+    });
+    let c = Arc::new(GopCache::new(None));
+    c.set_export_pinned(true);
+    c.set_export_work(true, 0);
+    assert_eq!(index_of(&c.frame(s.as_ref(), 31_000).unwrap()), 31);
+    (c, s)
+}
+type LaneRequest = (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<Result<usize, String>>);
+fn lane_request(c: &Arc<GopCache>, s: &Arc<LaneSamples>, target: i64, render: bool, cancel: Arc<AtomicBool>) -> LaneRequest {
+    lane_request_context(c, s, target, render, cancel, true)
+}
+fn lane_request_context(c: &Arc<GopCache>, s: &Arc<LaneSamples>, target: i64, render: bool, cancel: Arc<AtomicBool>, export: bool) -> LaneRequest {
+    let (c, s) = (c.clone(), s.clone());
+    let (send, done) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let result = filmcraft_media::cancel::with_cancel(&cancel, || {
+            filmcraft_media::cancel::with_export(export, || {
+                let fetch = || c.frame(s.as_ref(), target).map(|f| index_of(&f)).map_err(|e| e.to_string());
+                if render { filmcraft_frame::render_timing::task(fetch) } else { fetch() }
+            })
+        });
+        let _ = send.send(result);
+    });
+    (thread, done)
+}
+fn no_cancel() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+fn lane_waits(c: &GopCache) -> std::sync::mpsc::Receiver<usize> {
+    let (send, recv) = std::sync::mpsc::channel();
+    *c.shared.wait_observer.lock().unwrap() = Some(send);
+    recv
+}
+fn finish_lanes(c: &GopCache) {
+    c.set_export_work(false, 120);
+    c.set_export_pinned(false);
+    c.shared.pool.release_idle();
+    assert_eq!(c.shared.pool.decoders.load(Ordering::SeqCst), 0);
+    assert_eq!(c.shared.pool.export_decoders.load(Ordering::SeqCst), 0);
+    assert_eq!(c.shared.pool.bytes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn lanes_cut_in_finishes_before_blocked_prefetch_and_same_gop_continues_once() {
+    if std::env::var_os("FILMCRAFT_LANES_COUNTER_TEST_CHILD").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        // Isolate both process-global lifecycle counters and render timings from other tests.
+        let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", "gop::tests::lanes_cut_in_finishes_before_blocked_prefetch_and_same_gop_continues_once", "--test-threads=1"])
+            .env("FILMCRAFT_LANES_COUNTER_TEST_CHILD", "1")
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn isolated lane-counter test");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let failure = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "isolated lane-counter test failed: {status}");
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => break format!("waiting for isolated lane-counter test failed: {error}"),
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break "isolated lane-counter test exceeded 15 s".to_owned();
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        };
+        // Attempt both operations before failing, even if killing races with child exit.
+        let killed = child.kill();
+        let reaped = child.wait();
+        panic!("{failure}; kill: {killed:?}; reap: {reaped:?}");
+    }
+
+    let before = gop_stats();
+    let timing_before = filmcraft_frame::render_timing::times();
+    let (c, s) = lane_fixture_from(FloorSamples::new(ParSamples(samples(400, 200, 8, false))));
+    let waits = lane_waits(&c);
+    let (entered, resume) = s.gate(0, 64_000);
+    let (prefetch, prefetched) = lane_request(&c, &s, 95_000, false, no_cancel());
+    let started = entered.recv_timeout(Duration::from_secs(2));
+    let (same, same_done) = lane_request(&c, &s, 150_000, true, no_cancel());
+    let waiting = waits.recv_timeout(Duration::from_secs(2));
+    let (covered, covered_done) = lane_request(&c, &s, 95_000, true, no_cancel());
+    let covered_waiting = waits.recv_timeout(Duration::from_secs(2));
+    let (cut, cut_done) = lane_request(&c, &s, 220_000, true, no_cancel());
+    let cut_before_release = cut_done.recv_timeout(Duration::from_secs(2));
+    let _ = resume.send(()); // Always unblock before assertions or joins.
+    let first = prefetched.recv_timeout(Duration::from_secs(2));
+    let continued = same_done.recv_timeout(Duration::from_secs(2));
+    let covered_result = covered_done.recv_timeout(Duration::from_secs(2));
+    prefetch.join().unwrap();
+    same.join().unwrap();
+    cut.join().unwrap();
+    covered.join().unwrap();
+    assert!(started.is_ok());
+    assert_eq!(waiting.unwrap(), 0);
+    assert_eq!(covered_waiting.unwrap(), 0);
+    assert_eq!(covered_result.unwrap().unwrap(), 95);
+    assert_eq!(cut_before_release.unwrap().unwrap(), 220);
+    assert_eq!(first.unwrap().unwrap(), 95);
+    assert_eq!(continued.unwrap().unwrap(), 150);
+    assert_eq!(s.factories.load(Ordering::SeqCst), 2);
+    assert!(s.fed.lock().unwrap().iter().all(|&(lane, pts)| (pts < 200_000) == (lane == 0)));
+    let extra = c.lanes()[1].clone();
+    c.set_export_work(true, 119);
+    assert!(extra.state.lock().unwrap().decoder.is_some());
+    c.set_export_work(true, 120);
+    assert!(extra.state.lock().unwrap().decoder.is_none());
+    assert!(c.shared.state.lock().unwrap().decoder.is_some());
+    assert_eq!(c.shared.pool.export_decoders.load(Ordering::SeqCst), 1);
+    finish_lanes(&c);
+    let delta = gop_stats() - before;
+    assert_eq!(delta.lanes_created, 2);
+    assert_eq!(delta.lanes_released, 2);
+    assert!(delta.lanes_peak_per_source >= 2);
+    let timing_after = filmcraft_frame::render_timing::times();
+    let delta = ["decoderQueueMs", "decoderQueueCoveredMs", "decoderQueueNotCoveredMs", "decoderQueueBehindPrefetchMs"].map(|key| {
+        let get = |snapshot: &[(&str, u64)]| snapshot.iter().find(|(name, _)| *name == key).unwrap().1;
+        get(&timing_after) - get(&timing_before)
+    });
+    assert_eq!(delta[0], delta[1] + delta[2]);
+    assert!(delta[1] > 0 && delta[2] > 0 && delta[3] > 0);
+    assert!(delta[3] <= delta[0]);
+}
+
+#[test]
+fn lanes_continuing_run_stops_before_crossing_another_lanes_claim() {
+    let (c, s) = lane_fixture();
+    let waits = lane_waits(&c);
+    let (entered0, resume0) = s.gate(0, 64_000);
+    let (entered1, resume1) = s.gate(1, 210_000);
+    let (first, done0) = lane_request(&c, &s, 95_000, false, no_cancel());
+    let started0 = entered0.recv_timeout(Duration::from_secs(2));
+    let (second, done1) = lane_request(&c, &s, 220_000, true, no_cancel());
+    let started1 = entered1.recv_timeout(Duration::from_secs(2));
+    let floored_run = c.lanes()[1].run.snapshot();
+    let _ = resume0.send(());
+    let result0 = done0.recv_timeout(Duration::from_secs(2));
+    // Advance lane 0 within GOP 0 while lane 1 still owns GOP 200. At next=169,
+    // target 250 is continuable under the exact 48-relative-to-next predicate.
+    let primed = filmcraft_media::cancel::with_export(true, || c.frame(s.as_ref(), 160_000));
+    let (cross, crossed) = lane_request(&c, &s, 250_000, true, no_cancel());
+    let boundary_wait = waits.recv_timeout(Duration::from_secs(2));
+    let fed_before = s.fed.lock().unwrap().clone();
+    let cursor = c.shared.run.selection_snapshot().1;
+    let retained = c.shared.frames.lock().unwrap().frames.contains_key(&195_000);
+    let _ = resume1.send(());
+    let result1 = done1.recv_timeout(Duration::from_secs(2));
+    let result_cross = crossed.recv_timeout(Duration::from_secs(2));
+    first.join().unwrap();
+    second.join().unwrap();
+    cross.join().unwrap();
+    assert!(started0.is_ok() && started1.is_ok());
+    assert_eq!(boundary_wait.unwrap(), 1);
+    assert_eq!(cursor, usize::MAX, "old pending outputs were flushed before yielding");
+    assert!(!floored_run.unwrap().covers(210_000));
+    assert!(floored_run.unwrap().covers(220_000));
+    assert!(retained, "delayed output of the old GOP survived the claim conflict");
+    assert!(fed_before.iter().all(|&(lane, pts)| lane != 0 || pts < 200_000));
+    assert_eq!(result0.unwrap().unwrap(), 95);
+    assert_eq!(index_of(&primed.unwrap()), 160);
+    assert_eq!(result1.unwrap().unwrap(), 220);
+    assert_eq!(result_cross.unwrap().unwrap(), 250);
+    finish_lanes(&c);
+}
+
+#[test]
+fn lanes_errors_and_cancellation_wake_only_the_affected_run() {
+    for cancelled in [false, true] {
+        let (c, s) = lane_fixture();
+        let waits = lane_waits(&c);
+        let (entered, resume) = s.gate(0, 64_000);
+        let flag = no_cancel();
+        let (first, first_done) = lane_request(&c, &s, 95_000, false, flag.clone());
+        let started = entered.recv_timeout(Duration::from_secs(2));
+        let (waiter, waiter_done) = lane_request(&c, &s, 150_000, true, no_cancel());
+        let waiting = waits.recv_timeout(Duration::from_secs(2));
+        let (other, other_done) = lane_request(&c, &s, 220_000, true, no_cancel());
+        let independent = other_done.recv_timeout(Duration::from_secs(2));
+        if cancelled {
+            flag.store(true, Ordering::SeqCst);
+        } else {
+            s.fail_pts.store(64_000, Ordering::SeqCst);
+        }
+        let _ = resume.send(());
+        let failed = first_done.recv_timeout(Duration::from_secs(2));
+        let woken = waiter_done.recv_timeout(Duration::from_secs(2));
+        first.join().unwrap();
+        waiter.join().unwrap();
+        other.join().unwrap();
+        assert!(started.is_ok());
+        assert_eq!(waiting.unwrap(), 0);
+        assert_eq!(independent.unwrap().unwrap(), 220);
+        let message = if cancelled { "cancelled" } else { "lane-local failure" };
+        assert!(failed.unwrap().unwrap_err().contains(message));
+        if cancelled {
+            assert_eq!(woken.unwrap().unwrap(), 150, "uncancelled waiter retries its own request");
+        } else {
+            assert!(woken.unwrap().unwrap_err().contains(message));
+            assert!(!c.shared.frames.lock().unwrap().claims.values().any(|&lane| lane == 0));
+        }
+        assert!(c.shared.primary.outcome.lock().unwrap().is_none());
+        assert_eq!(index_of(&c.frame(s.as_ref(), 221_000).unwrap()), 221);
+        finish_lanes(&c);
+    }
+}
+
+#[test]
+fn lanes_membership_removal_retires_a_busy_extra_after_its_run() {
+    let (c, s) = lane_fixture();
+    let (entered0, resume0) = s.gate(0, 64_000);
+    let (entered1, resume1) = s.gate(1, 210_000);
+    let (first, done0) = lane_request(&c, &s, 95_000, false, no_cancel());
+    let started0 = entered0.recv_timeout(Duration::from_secs(2));
+    let (second, done1) = lane_request(&c, &s, 220_000, true, no_cancel());
+    let started1 = entered1.recv_timeout(Duration::from_secs(2));
+    c.set_export_work(false, 1);
+    let _ = resume0.send(());
+    let _ = resume1.send(());
+    let result0 = done0.recv_timeout(Duration::from_secs(2));
+    let result1 = done1.recv_timeout(Duration::from_secs(2));
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(started0.is_ok() && started1.is_ok());
+    assert_eq!(result0.unwrap().unwrap(), 95);
+    assert_eq!(result1.unwrap().unwrap(), 220);
+    assert!(c.lanes()[1].state.lock().unwrap().decoder.is_none());
+    assert!(c.shared.state.lock().unwrap().decoder.is_some());
+    finish_lanes(&c);
+}
+
+#[test]
+fn lanes_choice_uses_exact_continuation_then_floor_coverage_idle_new_and_index_ties() {
+    let c = GopCache::new(None);
+    let s = samples(400, 200, 8, false);
+    c.set_export_work(true, 0);
+    let extra = Arc::new(Lane::new(1, c.shared.pool.clone()));
+    c.shared.extra.lock().unwrap().push(extra.clone());
+    let publish = |lane: &Lane, next, start, out_max, run| {
+        let mut st = lane.state.lock().unwrap();
+        st.next = next;
+        st.start = start;
+        st.out_max = out_max;
+        lane.live.store(true, Ordering::SeqCst);
+        lane.run.publish_state(run, Some(&st));
+    };
+    let busy = Some(RunSnapshot { valid: false, start: 0, target: 95_000, floor: i64::MIN, origin: RunOrigin::Prefetch });
+    let covers = Some(RunSnapshot { valid: true, start: 200_000, target: 250_000, floor: 200_000, origin: RunOrigin::Render });
+    let choose = |limit, admitted| c.choose_lane_limit(&s, 220, 220_000, admitted, limit).id;
+    publish(&c.shared, 170, 0, 160_000, busy);
+    publish(&extra, 210, 200, 201_000, covers);
+    assert_eq!(choose(2, true), 0, "busy continuation wins over covered and a second continuation");
+    publish(&c.shared, 151, 0, 140_000, busy);
+    assert_eq!(choose(2, true), 1, "49 samples from next is not near");
+    publish(&c.shared, 152, 0, 140_000, busy);
+    assert_eq!(choose(2, true), 0, "48 samples from next is near regardless of target distance");
+    publish(&c.shared, 300, 300, 290_000, covers);
+    publish(&extra, 300, 300, 290_000, covers);
+    assert_eq!(choose(2, true), 0, "covered ties use lowest index");
+    publish(&extra, usize::MAX, 0, i64::MIN, None);
+    assert_eq!(choose(2, true), 0, "covered precedes idle");
+    publish(&c.shared, 300, 300, 290_000, covers.map(|r| RunSnapshot { floor: 221_000, ..r }));
+    assert_eq!(choose(2, true), 1, "floor-suppressed frame is not covered");
+    publish(&c.shared, usize::MAX, 0, i64::MIN, None);
+    assert_eq!(choose(2, true), 0, "idle ties use lowest index");
+    publish(&c.shared, 64, 0, 55_000, busy);
+    extra.live.store(false, Ordering::SeqCst);
+    assert_eq!(choose(2, true), 1, "new/released slot is admitted after idle");
+    publish(&extra, usize::MAX, 0, i64::MIN, busy);
+    assert_eq!(choose(2, false), 0, "all busy and no admission falls back to index zero");
+    assert_eq!(choose(1, true), 0, "L=1 keeps the primary");
+    assert_eq!(c.choose_lane(&s, 220, 220_000, true).id, 0, "playback never takes an extra");
+    c.set_export_work(false, 0);
+    assert_eq!(filmcraft_media::cancel::with_export(true, || c.choose_lane(&s, 220, 220_000, true).id), 0, "export needs scheduled membership");
+}
+
+#[test]
+fn lanes_reservations_and_pending_outputs_protect_both_eviction_paths() {
+    let pool = Arc::new(Pool::new(4, Duration::ZERO, 4));
+    let mut c = GopCache::in_pool(None, pool.clone());
+    c.budget = 4;
+    let run = RunSnapshot { valid: true, start: 20_000, target: 30_000, floor: 25_000, origin: RunOrigin::Render };
+    {
+        let mut frames = c.shared.frames.lock().unwrap();
+        frames.export_position = Some(100_000);
+        frames.pin = 100_000;
+        frames.reservations.insert(0, run);
+        frames.reservations.insert(1, RunSnapshot { start: 80_000, target: 90_000, floor: 80_000, ..run });
+        frames.pending.insert(0, RunSnapshot { start: 31_000, target: 38_000, floor: i64::MIN, ..run });
+        assert_eq!(frames.earliest_position(), Some(25_000));
+        assert!(!frames.reserved(24_000));
+        assert!(frames.reserved(25_000));
+        assert!(frames.reserved(38_000));
+        for i in 0..160 {
+            c.store_finished(&mut frames, i * 1000, picture((i * 1000, false)).frame, false);
+        }
+        for i in 25..=38 {
+            assert!(frames.frames.contains_key(&(i * 1000)));
+        }
+        assert!(frames.frames.contains_key(&80_000));
+        frames.release_frames(&pool, || true);
+        for i in 25..=38 {
+            assert!(frames.frames.contains_key(&(i * 1000)));
+        }
+        frames.reservations.clear();
+        frames.pending.clear();
+        frames.pin = i64::MIN;
+        frames.export_position = None;
+        frames.release_frames(&pool, || true);
+    }
+    assert_eq!(pool.bytes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn lanes_export_admission_is_atomic_counts_first_spares_private_and_rolls_back() {
+    let pool = Arc::new(Pool::new(4, Duration::ZERO, FRAME_BUDGET));
+    let tickets: Vec<_> = (0..15).map(|_| ExportSession::first(&pool)).collect();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let (pool, barrier) = (pool.clone(), barrier.clone());
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            ExportSession::extra(&pool)
+        }));
+    }
+    barrier.wait();
+    let reserved: Vec<_> = workers.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(reserved.iter().filter(|r| r.is_some()).count(), 1);
+    assert_eq!(pool.export_decoders.load(Ordering::SeqCst), 16);
+    let c = GopCache::in_pool(None, pool.clone());
+    c.set_export_pinned(true);
+    c.set_export_work(true, 0);
+    let s = samples(400, 200, 8, false);
+    assert_eq!(index_of(&c.frame(&s, 220_000).unwrap()), 220, "first lanes progress above the extra cap");
+    assert_eq!(pool.export_decoders.load(Ordering::SeqCst), 17);
+    let intra = GopCache::in_pool(None, pool.clone());
+    intra.set_export_pinned(true);
+    let is = samples(10, 1, 0, true);
+    assert_eq!(index_of(&filmcraft_media::cancel::with_export(true, || intra.frame(&is, 2_000)).unwrap()), 2);
+    assert_eq!(pool.export_decoders.load(Ordering::SeqCst), 19, "primary plus intra spare count");
+    let before_private = pool.export_decoders.load(Ordering::SeqCst);
+    filmcraft_media::cancel::with_export(true, || {
+        let _nested = DecodingGuard::enter(&c as *const GopCache as usize);
+        assert_eq!(index_of(&c.frame(&s, 1_000).unwrap()), 1);
+    });
+    assert_eq!(pool.export_decoders.load(Ordering::SeqCst), before_private, "private ticket was returned");
+    drop(reserved);
+    drop(tickets);
+    let failing = LaneSamples {
+        inner: Box::new(samples(4, 4, 0, false)),
+        gates: Default::default(),
+        fed: Default::default(),
+        factories: AtomicUsize::new(0),
+        fail_factory: AtomicBool::new(true),
+        fail_pts: Arc::new(AtomicI64::new(-1)),
+    };
+    let before_failure = pool.export_decoders.load(Ordering::SeqCst);
+    let result = Session::new(&failing, ExportSession::extra(&pool));
+    assert!(result.is_err());
+    assert_eq!(pool.export_decoders.load(Ordering::SeqCst), before_failure);
+    intra.set_export_pinned(false);
+    finish_lanes(&c);
+}
+
+#[test]
+fn lanes_claim_the_corrected_open_gop_key_before_reset_and_respect_its_floor() {
+    let inner = FloorSamples::new(OpenGop::new(60));
+    let key = decode_start(&inner, inner.sample_at(398_000).unwrap());
+    let s = Arc::new(LaneSamples {
+        inner: Box::new(inner),
+        gates: Default::default(),
+        fed: Default::default(),
+        factories: AtomicUsize::new(0),
+        fail_factory: AtomicBool::new(false),
+        fail_pts: Arc::new(AtomicI64::new(-1)),
+    });
+    let c = Arc::new(GopCache::new(None));
+    c.set_export_pinned(true);
+    c.set_export_work(true, 0);
+    let (entered0, resume0) = s.gate(0, 24_000);
+    let (entered1, resume1) = s.gate(1, 392_000);
+    let (first, done0) = lane_request(&c, &s, 31_000, false, no_cancel());
+    let started0 = entered0.recv_timeout(Duration::from_secs(2));
+    let (second, done1) = lane_request(&c, &s, 398_000, true, no_cancel());
+    let started1 = entered1.recv_timeout(Duration::from_secs(2));
+    let claimed = c.shared.frames.lock().unwrap().claims.get(&key).copied();
+    let run = c.lanes()[1].run.snapshot();
+    let _ = resume0.send(());
+    let _ = resume1.send(());
+    let result0 = done0.recv_timeout(Duration::from_secs(2));
+    let result1 = done1.recv_timeout(Duration::from_secs(2));
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(started0.is_ok() && started1.is_ok());
+    assert_eq!(claimed, Some(1));
+    assert_eq!(run.unwrap().start, 392_000);
+    assert_eq!(run.unwrap().floor, 398_000);
+    assert!(!run.unwrap().covers(397_000));
+    assert!(run.unwrap().covers(398_000));
+    assert_eq!(result0.unwrap().unwrap(), 31);
+    assert_eq!(result1.unwrap().unwrap(), 398);
+    finish_lanes(&c);
+}
+
+#[test]
+fn lanes_reentrant_requests_use_private_sessions_and_skip_pool_maintenance() {
+    let pool = Arc::new(Pool::new(1, Duration::ZERO, 0));
+    let a = GopCache::in_pool(None, pool.clone());
+    let b = GopCache::in_pool(None, pool.clone());
+    let idle = GopCache::in_pool(None, pool.clone());
+    let s = samples(100, 100, 8, false);
+    idle.frame(&s, 0).unwrap();
+    a.set_export_pinned(true);
+    a.frame(&s, 0).unwrap();
+    // Refill an idle peer without running maintenance, then hold a real primary mutex.
+    idle.store_finished(&mut idle.shared.frames.lock().unwrap(), 1_000, picture((1_000, false)).frame, false);
+    let held = a.shared.state.lock().unwrap();
+    let decoding = DecodingGuard::enter(&a as *const GopCache as usize);
+    let nested = filmcraft_media::cancel::with_export(true, || b.frame(&s, 50_000));
+    let took_another_lane = b.shared.primary.live.load(Ordering::SeqCst);
+    let preserved_peer = idle.shared.frames.lock().unwrap().frames.contains_key(&1_000);
+    drop(decoding);
+    drop(held);
+    assert_eq!(index_of(&nested.unwrap()), 50);
+    assert!(!took_another_lane, "nested requests must not acquire a second lane, even of another cache");
+    assert!(b.shared.state.lock().unwrap().decoder.is_none());
+    assert!(preserved_peer, "nested after_request must not lock peer lanes for pool maintenance");
+    // Playback retains cross-source cached decoding and ordinary pool maintenance.
+    let held = a.shared.state.lock().unwrap();
+    let before_next = held.next;
+    let decoding = DecodingGuard::enter(&a as *const GopCache as usize);
+    let playback = b.frame(&s, 50_000);
+    let playback_lane = b.shared.primary.live.load(Ordering::SeqCst);
+    let evicted_peer = !idle.shared.frames.lock().unwrap().frames.contains_key(&1_000);
+    let same_source = a.frame(&s, 60_000);
+    let cursor_unchanged = held.next == before_next;
+    drop(decoding);
+    drop(held);
+    assert_eq!(index_of(&playback.unwrap()), 50);
+    assert!(playback_lane, "playback cross-source requests retain a cached primary session");
+    assert!(evicted_peer, "playback pool maintenance is not suppressed by another source");
+    assert_eq!(index_of(&same_source.unwrap()), 60);
+    assert!(cursor_unchanged, "same-source playback fallback kept the caller's cursor");
+    a.set_export_pinned(false);
+    pool.release_idle();
+    assert_eq!(pool.decoders.load(Ordering::SeqCst), 0);
+    assert_eq!(pool.export_decoders.load(Ordering::SeqCst), 0);
+    assert_eq!(pool.bytes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn lanes_maintenance_lock_never_replays_a_completed_error() {
+    let (c, s) = lane_fixture();
+    s.fail_pts.store(64_000, Ordering::SeqCst);
+    let failed = filmcraft_media::cancel::with_export(true, || c.frame(s.as_ref(), 95_000));
+    s.fail_pts.store(-1, Ordering::SeqCst);
+    let waits = lane_waits(&c);
+    let held = lock_decoder(&c.shared, None); // same holder used by pin/intra maintenance
+    let inactive = c.shared.primary.outcome.lock().unwrap().is_none() && c.shared.run.snapshot().is_none();
+    let (waiter, done) = lane_request(&c, &s, 150_000, true, no_cancel());
+    let waiting = waits.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    let result = done.recv_timeout(Duration::from_secs(2));
+    waiter.join().unwrap();
+    assert!(failed.unwrap_err().to_string().contains("lane-local failure"));
+    assert!(inactive);
+    assert_eq!(waiting.unwrap(), 0);
+    assert_eq!(result.unwrap().unwrap(), 150);
+    finish_lanes(&c);
+}
+
+#[test]
+fn lanes_playback_results_are_not_propagated_between_requests() {
+    for (holder_export, waiter_export) in [(false, false), (true, false), (false, true)] {
+        for cancelled in [false, true] {
+            let (c, s) = lane_fixture();
+            // Force the export waiter to observe the playback holder on the primary too.
+            c.set_export_work(false, 0);
+            let waits = lane_waits(&c);
+            let (entered, resume) = s.gate(0, 64_000);
+            let flag = no_cancel();
+            let (holder, holder_done) = lane_request_context(&c, &s, 95_000, false, flag.clone(), holder_export);
+            let started = entered.recv_timeout(Duration::from_secs(2));
+            let (waiter, done) = lane_request_context(&c, &s, 220_000, true, no_cancel(), waiter_export);
+            let waiting = waits.recv_timeout(Duration::from_secs(2));
+            if cancelled {
+                flag.store(true, Ordering::SeqCst);
+            } else {
+                s.fail_pts.store(64_000, Ordering::SeqCst);
+            }
+            let _ = resume.send(());
+            let failed = holder_done.recv_timeout(Duration::from_secs(2));
+            let result = done.recv_timeout(Duration::from_secs(2));
+            holder.join().unwrap();
+            waiter.join().unwrap();
+            assert!(started.is_ok());
+            assert_eq!(waiting.unwrap(), 0);
+            let message = if cancelled { "cancelled" } else { "lane-local failure" };
+            assert!(failed.unwrap().unwrap_err().contains(message));
+            assert_eq!(result.unwrap().unwrap(), 220);
+            assert_eq!(s.factories.load(Ordering::SeqCst), 1, "playback uses the primary session");
+            finish_lanes(&c);
+        }
+    }
+}
+
+#[test]
+fn lanes_cancelled_waiter_checks_its_own_flag_after_wakeup() {
+    for cancel_holder in [false, true] {
+        let (c, s) = lane_fixture();
+        let waits = lane_waits(&c);
+        let (entered, resume) = s.gate(0, 64_000);
+        let holder_flag = no_cancel();
+        let waiter_flag = no_cancel();
+        let (holder, holder_done) = lane_request(&c, &s, 95_000, false, holder_flag.clone());
+        let started = entered.recv_timeout(Duration::from_secs(2));
+        // When the holder succeeds the frame is cached by wakeup: cancellation still wins.
+        let (waiter, done) = lane_request(&c, &s, 95_000, true, waiter_flag.clone());
+        let waiting = waits.recv_timeout(Duration::from_secs(2));
+        holder_flag.store(cancel_holder, Ordering::SeqCst);
+        waiter_flag.store(true, Ordering::SeqCst);
+        let _ = resume.send(());
+        let holder_result = holder_done.recv_timeout(Duration::from_secs(2));
+        let result = done.recv_timeout(Duration::from_secs(2));
+        holder.join().unwrap();
+        waiter.join().unwrap();
+        assert!(started.is_ok());
+        assert_eq!(waiting.unwrap(), 0);
+        if cancel_holder {
+            assert!(holder_result.unwrap().unwrap_err().contains("cancelled"));
+        } else {
+            assert_eq!(holder_result.unwrap().unwrap(), 95);
+        }
+        assert!(result.unwrap().unwrap_err().contains("cancelled"));
+        finish_lanes(&c);
+    }
+}
+
+#[test]
+fn lanes_idle_primary_pending_expires_with_export_position_in_both_eviction_paths() {
+    for local in [false, true] {
+        let pool = Arc::new(Pool::new(4, Duration::ZERO, 4));
+        let mut c = GopCache::in_pool(None, pool.clone());
+        c.budget = 4;
+        let s = FloorSamples::new(samples(400, 200, 8, false));
+        c.set_export_pinned(true);
+        c.set_export_work(true, 0);
+        let first = filmcraft_media::cancel::with_export(true, || c.frame(&s, 31_000));
+        assert_eq!(index_of(&first.unwrap()), 31);
+        c.set_export_position(&s, 35_000);
+        {
+            let frames = c.shared.frames.lock().unwrap();
+            assert_eq!(frames.earliest_position(), Some(35_000));
+            assert_eq!(frames.pending[&0].start, 35_000);
+            assert!(frames.reserved(38_000), "still-needed delayed output stays protected");
+        }
+        assert_eq!(index_of(&filmcraft_media::cancel::with_export(true, || c.frame(&s, 35_000)).unwrap()), 35);
+        {
+            let mut frames = c.shared.frames.lock().unwrap();
+            frames.pin = 100_000;
+            frames.reservations.insert(1, RunSnapshot { valid: true, start: 36_000, target: 38_000, floor: 36_000, origin: RunOrigin::Render });
+            for i in 0..180 {
+                c.store_finished(&mut frames, i * 1000, picture((i * 1000, false)).frame, false);
+            }
+            if !local {
+                frames.release_frames(&pool, || true);
+            }
+            assert!(frames.frames.contains_key(&38_000));
+        }
+        c.set_export_position(&s, 100_000);
+        {
+            let mut frames = c.shared.frames.lock().unwrap();
+            assert_eq!(frames.earliest_position(), Some(36_000));
+            assert!(frames.reserved(38_000), "another active run still needs this pending output");
+            frames.reservations.remove(&1);
+        }
+        c.set_export_work(true, 1);
+        {
+            let mut frames = c.shared.frames.lock().unwrap();
+            assert!(!frames.pending.contains_key(&0), "idle primary no longer pins passed work");
+            assert_eq!(frames.earliest_position(), Some(100_000));
+            if local {
+                c.store_finished(&mut frames, 180_000, picture((180_000, false)).frame, false);
+            } else {
+                frames.release_frames(&pool, || true);
+            }
+            assert!(!frames.frames.contains_key(&38_000));
+            assert!(!frames.frames.keys().any(|&pts| pts < 100_000));
+        }
+        assert!(c.shared.state.lock().unwrap().decoder.is_some(), "primary session was not retired");
+        finish_lanes(&c);
+    }
+}

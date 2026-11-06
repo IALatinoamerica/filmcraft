@@ -39,14 +39,16 @@ pub(crate) struct Scheduler {
     pipe: Arc<Pipeline>,
     sources: Vec<ScheduledSource>,
     cancel: Arc<AtomicBool>,
+    progress: i64,
 }
 
 impl Scheduler {
     pub(crate) fn new(pipe: Arc<Pipeline>) -> Self {
-        Self { pipe, sources: Vec::new(), cancel: Arc::new(AtomicBool::new(false)) }
+        Self { pipe, sources: Vec::new(), cancel: Arc::new(AtomicBool::new(false)), progress: 0 }
     }
 
     pub(crate) fn advance(&mut self, next: i64, end: i64, sources: &dyn SourceProvider, cancelled: bool) -> Result<()> {
+        self.progress = next;
         self.cancel.store(cancelled, Ordering::Relaxed);
         self.reap()?;
         if self.cancel.load(Ordering::Relaxed) {
@@ -70,6 +72,7 @@ impl Scheduler {
         // Source PTS need not increase with output time (reverse, remap, shared aliases).
         // Include all still-needed uses, not the newest request decoded ahead of the renderer.
         for state in &self.sources {
+            state.source.set_export_work(true, next);
             let upcoming = work.iter().find(|w| Arc::ptr_eq(&state.source, &w.source)).into_iter().flat_map(|w| &w.requests);
             if let Some(time) = state.submitted.iter().chain(upcoming).map(|r| r.request.time).min() {
                 state.source.set_export_position(time);
@@ -152,6 +155,7 @@ impl Scheduler {
             Some(i) => i,
             None if self.sources.len() < MAX_SOURCES && *remaining >= bytes => {
                 w.source.set_export_pinned(true);
+                w.source.set_export_work(true, next);
                 if let Some(time) = w.requests.iter().map(|r| r.request.time).min() {
                     w.source.set_export_position(time);
                 }
@@ -166,6 +170,10 @@ impl Scheduler {
                 old.last = old.last.max(r.last);
             }
             state.last = state.last.max(r.last);
+        }
+        state.source.set_export_work(true, next);
+        if let Some(time) = state.submitted.iter().chain(&w.requests).map(|r| r.request.time).min() {
+            state.source.set_export_position(time);
         }
         if state.job.is_some() {
             return;
@@ -232,7 +240,9 @@ impl Scheduler {
         for state in &mut self.sources {
             let result = state.job.as_ref().map(Receiver::try_recv);
             match result {
-                Some(Ok(true)) => state.job = None,
+                Some(Ok(true)) => {
+                    state.job = None;
+                }
                 Some(Ok(false) | Err(TryRecvError::Disconnected)) => return Err(ExportError::Encode("internal error while prefetching source frames".into())),
                 Some(Err(TryRecvError::Empty)) | None => {}
             }
@@ -244,6 +254,7 @@ impl Scheduler {
         self.sources.retain_mut(|state| {
             state.submitted.retain(|r| r.last >= next);
             if state.last < next && state.job.is_none() {
+                state.source.set_export_work(false, next);
                 state.source.set_export_pinned(false);
                 false
             } else {
@@ -262,6 +273,7 @@ impl Scheduler {
             if let Some(done) = state.job.take() {
                 failed |= !matches!(done.recv(), Ok(true));
             }
+            state.source.set_export_work(false, self.progress);
             state.source.set_export_pinned(false);
         }
         self.sources.clear();

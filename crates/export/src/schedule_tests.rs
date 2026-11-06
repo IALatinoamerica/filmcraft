@@ -16,6 +16,7 @@ struct Recording {
     fetched: Mutex<Vec<FrameRequest>>,
     prefetched: Mutex<Vec<FrameRequest>>,
     positions: Mutex<Vec<Tick>>,
+    work: Mutex<Vec<(bool, i64)>>,
     pinned: AtomicBool,
     active: AtomicUsize,
     peak: AtomicUsize,
@@ -31,6 +32,7 @@ impl Recording {
             fetched: Default::default(),
             prefetched: Default::default(),
             positions: Default::default(),
+            work: Default::default(),
             pinned: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -55,6 +57,8 @@ impl MediaSource for Recording {
     fn prefetch(&self, requests: &[FrameRequest]) {
         assert!(cancel::export());
         assert!(self.pinned.load(Ordering::Relaxed));
+        assert!(self.work.lock().unwrap().last().is_some_and(|&(scheduled, _)| scheduled));
+        assert!(!self.positions.lock().unwrap().is_empty(), "position published before launch");
         let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak.fetch_max(active, Ordering::Relaxed);
         for &request in requests {
@@ -79,6 +83,13 @@ impl MediaSource for Recording {
         }
         self.pinned.store(pinned, Ordering::Relaxed);
         self.inner.set_export_pinned(pinned);
+    }
+    fn set_export_work(&self, scheduled: bool, output_frame: i64) {
+        if !scheduled {
+            assert_eq!(self.active.load(Ordering::Relaxed), 0, "join before removing membership");
+        }
+        self.work.lock().unwrap().push((scheduled, output_frame));
+        self.inner.set_export_work(scheduled, output_frame);
     }
     fn set_export_position(&self, time: Tick) {
         assert!(self.pinned.load(Ordering::Relaxed));
@@ -166,7 +177,8 @@ fn scheduler_eviction_position_tracks_needed_requests_while_prefetch_runs_ahead(
     *movie.started.lock().unwrap() = Some(send);
     let mut scheduler = new_scheduler(&p, seq);
     advance(&mut scheduler, 0, 24, &map).unwrap();
-    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let started = started.recv_timeout(Duration::from_secs(5));
+    let mut observations = Vec::new();
     for next in [0, 6, 12, 18] {
         advance(&mut scheduler, next, 24, &map).unwrap();
         let source: SharedSource = movie.clone();
@@ -176,9 +188,14 @@ fn scheduler_eviction_position_tracks_needed_requests_while_prefetch_runs_ahead(
             .map(|(_, r)| r.time)
             .min()
             .unwrap();
-        assert_eq!(movie.positions.lock().unwrap().last(), Some(&expected), "output frame {next}");
+        observations.push((next, expected, movie.positions.lock().unwrap().last().copied(), movie.work.lock().unwrap().last().copied()));
     }
     scheduler.stop(true).unwrap();
+    assert!(started.is_ok());
+    for (next, expected, position, work) in observations {
+        assert_eq!(position, Some(expected), "outstanding job at output frame {next}");
+        assert_eq!(work, Some((true, next)));
+    }
     assert!(!movie.pinned.load(Ordering::Relaxed));
 }
 
@@ -398,4 +415,36 @@ fn scheduler_sliding_window_deduplicates_holds_and_releases_finished_sources() {
         assert_eq!(*recorded[0].prefetched.lock().unwrap(), [FrameRequest::full(FrameRate::FPS_24.tick_of(5))]);
         scheduler.stop(false).unwrap();
     });
+}
+
+#[test]
+fn scheduler_publishes_output_frame_progress_119_120_and_clears_after_join() {
+    let (p, seq, map, recorded) = fixture();
+    let mut p = (*p).clone();
+    let tracks = &mut p.sequence_mut(seq).unwrap().video_tracks;
+    tracks.truncate(1);
+    tracks[0].items.truncate(1);
+    tracks[0].items[0].duration = FrameRate::FPS_24.tick_of(160);
+    tracks[0].items[0].frame_hold = Some(FrameRate::FPS_24.tick_of(5));
+    let movie = &recorded[0];
+    movie.block.store(true, Ordering::Relaxed);
+    let (send, started) = mpsc::channel();
+    *movie.started.lock().unwrap() = Some(send);
+    let mut scheduler = new_scheduler(&p, seq);
+    advance(&mut scheduler, 0, 180, &map).unwrap();
+    let begun = started.recv_timeout(Duration::from_secs(2));
+    let at119 = advance(&mut scheduler, 119, 180, &map);
+    let at120 = advance(&mut scheduler, 120, 180, &map);
+    let busy_work = movie.work.lock().unwrap().clone();
+    let busy_position = movie.positions.lock().unwrap().last().copied();
+    let stopped = scheduler.stop(true); // Releases the mock through its cancellation flag.
+    assert!(begun.is_ok());
+    assert!(at119.is_ok() && at120.is_ok());
+    assert!(stopped.is_ok());
+    assert!(busy_work.contains(&(true, 119)) && busy_work.contains(&(true, 120)));
+    assert_eq!(busy_position, Some(FrameRate::FPS_24.tick_of(5)), "source PTS holds while output-frame progress advances");
+    assert_eq!(movie.work.lock().unwrap().last(), Some(&(false, 120)));
+    assert_eq!(movie.active.load(Ordering::SeqCst), 0);
+    assert!(!movie.pinned.load(Ordering::SeqCst));
+    assert_eq!(movie.peak.load(Ordering::SeqCst), 1, "one prefetch job per source remains unchanged");
 }

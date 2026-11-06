@@ -579,6 +579,9 @@ impl MediaSource for UnsupportedAsSlate {
     fn set_export_pinned(&self, pinned: bool) {
         self.inner.set_export_pinned(pinned);
     }
+    fn set_export_work(&self, scheduled: bool, output_frame: i64) {
+        self.inner.set_export_work(scheduled, output_frame);
+    }
     fn set_export_position(&self, time: filmcraft_time::Tick) {
         self.inner.set_export_position(time);
     }
@@ -899,7 +902,7 @@ mod tests {
 
     #[test]
     fn unsupported_as_slate_prefetch_forwards_and_preserves_frames() {
-        struct Recording(GeneratorSource, Mutex<Vec<FrameRequest>>, Mutex<Vec<filmcraft_time::Tick>>);
+        struct Recording(GeneratorSource, Mutex<Vec<FrameRequest>>, Mutex<Vec<filmcraft_time::Tick>>, Mutex<Vec<(bool, i64)>>);
         impl MediaSource for Recording {
             fn info(&self) -> &MediaInfo {
                 self.0.info()
@@ -909,6 +912,9 @@ mod tests {
             }
             fn set_export_position(&self, time: filmcraft_time::Tick) {
                 self.2.lock().unwrap().push(time);
+            }
+            fn set_export_work(&self, scheduled: bool, output_frame: i64) {
+                self.3.lock().unwrap().push((scheduled, output_frame));
             }
             fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
                 self.0.video_frame(req)
@@ -922,6 +928,7 @@ mod tests {
             GeneratorSource::new(filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Aurora), 16, 8, rate, rate.tick_of(24)),
             Mutex::new(Vec::new()),
             Mutex::new(Vec::new()),
+            Mutex::new(Vec::new()),
         ));
         let pool = MediaPool::default();
         let src = pool.unsupported_as_slate(ItemId(1), "a.mov", inner.clone());
@@ -929,6 +936,10 @@ mod tests {
         let expected: Vec<_> = requests.iter().map(|&req| src.video_frame(req).unwrap()).collect();
         src.prefetch(&requests);
         assert_eq!(*inner.1.lock().unwrap(), requests);
+        src.set_export_work(true, 119);
+        src.set_export_work(true, 120);
+        src.set_export_work(false, 121);
+        assert_eq!(*inner.3.lock().unwrap(), [(true, 119), (true, 120), (false, 121)]);
         src.set_export_position(requests[0].time);
         assert_eq!(*inner.2.lock().unwrap(), [requests[0].time]);
         for (&req, expected) in requests.iter().zip(expected) {
