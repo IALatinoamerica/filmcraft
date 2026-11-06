@@ -5,7 +5,7 @@
 //! for the next frames therefore hit the cache or continue the running decoder without re-seeking.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 use std::time::Duration;
 
@@ -353,9 +353,40 @@ fn lock_frames(frames: &Mutex<Frames>) -> std::sync::MutexGuard<'_, Frames> {
     frames.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn lock_decoder(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
-    let _wait = filmcraft_frame::render_timing::enter(filmcraft_frame::render_timing::Phase::DecoderQueue);
-    state.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock_decoder(shared: &Shared, want_pts: Option<i64>) -> DecoderStateGuard<'_> {
+    // Sample once, before the existing acquisition interval. Never lock the busy state to
+    // inspect its holder. A changed holder during this wait does not change its attribution.
+    let run = shared.run.snapshot();
+    let covered = run.is_some_and(|run| want_pts.is_some_and(|pts| run.covers(pts)));
+    let prefetch = run.is_some_and(|run| run.origin == RunOrigin::Prefetch);
+    let _wait = filmcraft_frame::render_timing::decoder_queue(covered, prefetch);
+    DecoderStateGuard { state: shared.state.lock().unwrap_or_else(PoisonError::into_inner), run: &shared.run }
+}
+
+/// Own the publication as long as the decoder mutex, including errors, cancellation and
+/// unwind. Drop clears the descriptor before the inner mutex guard can unlock or transfer.
+struct DecoderStateGuard<'a> {
+    state: MutexGuard<'a, State>,
+    run: &'a RunDescriptor,
+}
+
+impl std::ops::Deref for DecoderStateGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for DecoderStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+}
+
+impl Drop for DecoderStateGuard<'_> {
+    fn drop(&mut self) {
+        self.run.publish(None);
+    }
 }
 
 /// Keep eviction centered on the active decode, not a concurrent hit or waiting miss.
@@ -468,10 +499,116 @@ struct Pool {
     budget: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RunOrigin {
+    Other,
+    Render,
+    Prefetch,
+}
+
+impl RunOrigin {
+    fn current() -> Self {
+        if filmcraft_frame::render_timing::active() {
+            Self::Render
+        } else if filmcraft_media::cancel::export() {
+            Self::Prefetch
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunSnapshot {
+    valid: bool,
+    start: i64,
+    target: i64,
+    floor: i64,
+    origin: RunOrigin,
+}
+
+impl RunSnapshot {
+    fn covers(self, pts: i64) -> bool {
+        self.valid && pts >= self.start && pts <= self.target && pts >= self.floor
+    }
+}
+
+/// Single writer, serialized by Shared.state. All operations are SeqCst so an accepted
+/// even version brackets exactly one complete publication, including inactive states.
+#[derive(Default)]
+struct RunDescriptor {
+    version: AtomicU64,
+    active: AtomicBool,
+    valid: AtomicBool,
+    start: AtomicI64,
+    target: AtomicI64,
+    floor: AtomicI64,
+    origin: AtomicU8,
+}
+
+impl RunDescriptor {
+    fn publish(&self, run: Option<RunSnapshot>) {
+        self.version.fetch_add(1, Ordering::SeqCst);
+        self.active.store(run.is_some(), Ordering::SeqCst);
+        if let Some(run) = run {
+            self.valid.store(run.valid, Ordering::SeqCst);
+            self.start.store(run.start, Ordering::SeqCst);
+            self.target.store(run.target, Ordering::SeqCst);
+            self.floor.store(run.floor, Ordering::SeqCst);
+            self.origin.store(run.origin as u8, Ordering::SeqCst);
+        }
+        self.version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> Option<RunSnapshot> {
+        loop {
+            let version = self.version.load(Ordering::SeqCst);
+            if !version.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let active = self.active.load(Ordering::SeqCst);
+            let run = RunSnapshot {
+                valid: self.valid.load(Ordering::SeqCst),
+                start: self.start.load(Ordering::SeqCst),
+                target: self.target.load(Ordering::SeqCst),
+                floor: self.floor.load(Ordering::SeqCst),
+                origin: match self.origin.load(Ordering::SeqCst) {
+                    1 => RunOrigin::Render,
+                    2 => RunOrigin::Prefetch,
+                    _ => RunOrigin::Other,
+                },
+            };
+            if version == self.version.load(Ordering::SeqCst) {
+                return active.then_some(run);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn reserve(&self, st: &State, s: &dyn VideoSamples, target: i64, floor: Option<i64>, origin: RunOrigin) {
+        // Keep pending pictures between out_max and next in the reservation. Starting at
+        // pts(next) would incorrectly exclude delayed output. Never promise already-output
+        // (possibly evicted) pictures, or speculative pictures beyond the requested target.
+        let mut valid = st.next <= s.count() && st.start < s.count();
+        let mut start = if valid { s.pts(st.start) } else { target };
+        if st.out_max >= start {
+            if let Some(after) = st.out_max.checked_add(1) {
+                start = after;
+            } else {
+                valid = false;
+            }
+        }
+        self.publish(Some(RunSnapshot { valid: valid && start <= target, start, target, floor: floor.unwrap_or(i64::MIN), origin }));
+    }
+}
+
 /// The part of a [`GopCache`] its pool reaches.
 struct Shared {
     // Lock order: decoder state, then frames. Never decode or trim other caches with frames held.
     state: Mutex<State>,
+    run: RunDescriptor,
     frames: Mutex<Frames>,
     pool: Arc<Pool>,
 }
@@ -767,6 +904,7 @@ impl GopCache {
                 start: 0,
                 out_max: i64::MIN,
             }),
+            run: RunDescriptor::default(),
             frames: Mutex::new(Frames {
                 frames: BTreeMap::new(),
                 used: BTreeSet::new(),
@@ -789,7 +927,7 @@ impl GopCache {
     /// Exclude this cache's decoder from the limits and recycling while export work needs it.
     /// A boolean pin: repeated pin or unpin calls are idempotent.
     pub fn set_export_pinned(&self, pinned: bool) {
-        let mut st = lock_decoder(&self.shared.state);
+        let mut st = lock_decoder(&self.shared, None);
         if st.export_pinned == pinned {
             return;
         }
@@ -1027,8 +1165,11 @@ impl GopCache {
         // after the guard on every return path: dropping a decoder can block.
         let mut released: Vec<Box<dyn VideoDecoder>> = Vec::new();
         let wait = Instant::now();
-        let mut st = lock_decoder(&self.shared.state);
+        let mut st = lock_decoder(&self.shared, Some(want_pts));
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        // Capture before isolated/decode_run clears the render clock.
+        let origin = RunOrigin::current();
+        self.shared.run.publish(Some(RunSnapshot { valid: false, start: want_pts, target: want_pts, floor: i64::MIN, origin }));
         let _decoding = DecodingGuard::enter(me);
         if let Some(taken) = self.cached(want_pts, draft, background) {
             return Ok(taken);
@@ -1093,6 +1234,8 @@ impl GopCache {
 
     /// Decode (the lock held) until the frame with `want_pts` (sample `i`) is cached; return it.
     fn decode_until(&self, st: &mut State, s: &dyn VideoSamples, i: usize, want_pts: i64, late_before: Option<i64>, draft: bool) -> crate::Result<Taken> {
+        // Only this mutex holder writes the descriptor; its origin was captured by the caller.
+        let origin = self.shared.run.snapshot().map_or(RunOrigin::Other, |run| run.origin);
         let n = s.count();
         let mut allow_floor = filmcraft_media::cancel::export();
         loop {
@@ -1140,6 +1283,8 @@ impl GopCache {
                 st.start = key;
                 st.out_max = i64::MIN;
             }
+            let mut floor = floored.then_some(want_pts);
+            self.shared.run.reserve(st, s, want_pts, floor, origin);
             let decoded: crate::Result<()> = (|| {
                 let limit = (i.max(st.next) + 64).min(n);
                 let late = late_before.unwrap_or(i64::MIN).min(want_pts);
@@ -1166,21 +1311,21 @@ impl GopCache {
                     st.next += 1;
                     DECODED.fetch_add(1, Ordering::Relaxed);
                     self.store_output(st, out);
+                    self.shared.run.reserve(st, s, want_pts, floor, origin);
                     if lock_frames(&self.shared.frames).cached(want_pts, draft).is_some() {
                         break;
                     }
                 }
                 if lock_frames(&self.shared.frames).cached(want_pts, draft).is_none() {
-                    let out = st
-                        .decoder
-                        .as_mut()
-                        .map(|d| {
-                            d.set_output_floor(None);
-                            timed(|| d.flush())
-                        })
-                        .unwrap_or_default();
+                    floor = None;
+                    if let Some(d) = st.decoder.as_mut() {
+                        d.set_output_floor(None);
+                    }
+                    self.shared.run.reserve(st, s, want_pts, floor, origin);
+                    let out = st.decoder.as_mut().map(|d| timed(|| d.flush())).unwrap_or_default();
                     self.store_output(st, out);
                     st.next = usize::MAX;
+                    self.shared.run.reserve(st, s, want_pts, floor, origin);
                 }
                 Ok(())
             })();
@@ -1189,6 +1334,7 @@ impl GopCache {
             if let Some(d) = st.decoder.as_mut() {
                 d.set_output_floor(None);
             }
+            self.shared.run.reserve(st, s, want_pts, None, origin);
             if floored && decoded.is_err() {
                 // Earlier pictures may have been suppressed before an interrupted cut-in.
                 // A later request for one must restart, rather than continue past it.
@@ -1200,6 +1346,7 @@ impl GopCache {
                 // Replay once without suppression so at_or_before sees the old path's candidates.
                 allow_floor = false;
                 st.next = usize::MAX;
+                self.shared.run.reserve(st, s, want_pts, None, origin);
                 continue;
             }
             // nearest decoded frame at or before the wanted pts (robust to decoder pts quirks)
@@ -1274,7 +1421,7 @@ impl GopCache {
 
     /// Intra-only streams: decode the one sample outside the lock, so several frame workers
     /// decode different frames of the same source at once.
-    fn intra_frame(&self, st: std::sync::MutexGuard<'_, State>, s: &dyn VideoSamples, i: usize, want_pts: i64) -> crate::Result<Taken> {
+    fn intra_frame(&self, st: DecoderStateGuard<'_>, s: &dyn VideoSamples, i: usize, want_pts: i64) -> crate::Result<Taken> {
         let mut st = st;
         let spare = st.spare.pop();
         drop(st);
@@ -1288,7 +1435,7 @@ impl GopCache {
         });
         let res = res.inspect(|out| count_frames(out));
         let wait = Instant::now();
-        let mut st = lock_decoder(&self.shared.state);
+        let mut st = lock_decoder(&self.shared, Some(want_pts));
         LOCK_WAIT_NS.fetch_add(wait.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         if st.spare.len() < 16 {
             st.spare.push(dec);

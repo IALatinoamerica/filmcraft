@@ -1,4 +1,92 @@
 #[test]
+fn run_descriptor_snapshots_are_coherent_and_bounds_are_inclusive() {
+    let descriptor = Arc::new(RunDescriptor::default());
+    assert_eq!(descriptor.snapshot(), None);
+    let a = RunSnapshot { valid: true, start: 10, target: 30, floor: 20, origin: RunOrigin::Prefetch };
+    let b = RunSnapshot { valid: false, start: -20, target: -10, floor: -30, origin: RunOrigin::Render };
+    assert!(!a.covers(9));
+    assert!(!a.covers(19));
+    assert!(a.covers(20));
+    assert!(a.covers(30));
+    assert!(!a.covers(31));
+    assert!(RunSnapshot { floor: i64::MIN, ..a }.covers(10));
+    assert!(!b.covers(-15));
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let writer = {
+        let (descriptor, start) = (descriptor.clone(), start.clone());
+        std::thread::spawn(move || {
+            start.wait();
+            // One writer, just as under Shared.state in production.
+            for _ in 0..10_000 {
+                descriptor.publish(Some(a));
+                descriptor.publish(Some(b));
+                descriptor.publish(None);
+            }
+        })
+    };
+    start.wait();
+    for _ in 0..30_000 {
+        if let Some(run) = descriptor.snapshot() {
+            assert!(run == a || run == b, "mixed publication: {run:?}");
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(descriptor.snapshot(), None);
+}
+
+#[test]
+fn run_reservation_tracks_corrected_start_pending_output_and_target() {
+    let c = GopCache::new(None);
+    let s = samples(100, 30, 8, false);
+    let mut st = lock_decoder(&c.shared, None);
+    st.start = 30; // the actual corrected random-access key, not the caller's original key
+    st.next = 45; // 37..44 are still pending in the decoder
+    st.out_max = 36_000;
+    c.shared.run.reserve(&st, &s, 40_000, None, RunOrigin::Render);
+    let run = c.shared.run.snapshot().unwrap();
+    assert_eq!(run.start, 36_001);
+    assert!(!run.covers(36_000), "already output/evicted is not promised");
+    assert!(run.covers(37_000), "pending output precedes pts(next)");
+    assert!(run.covers(40_000));
+    assert!(!run.covers(41_000), "speculative decode past target is not promised");
+    st.out_max = i64::MIN;
+    st.next = 30;
+    c.shared.run.reserve(&st, &s, 40_000, Some(40_000), RunOrigin::Prefetch);
+    assert_eq!(c.shared.run.snapshot().unwrap().start, 30_000);
+    assert!(!c.shared.run.snapshot().unwrap().covers(39_000));
+    c.shared.run.reserve(&st, &s, 40_000, None, RunOrigin::Prefetch);
+    assert!(c.shared.run.snapshot().unwrap().covers(30_000), "floor cleared before flush");
+    drop(st);
+    assert_eq!(c.shared.run.snapshot(), None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let st = lock_decoder(&c.shared, None);
+        c.shared.run.reserve(&st, &s, 40_000, None, RunOrigin::Other);
+        panic!("holder unwind");
+    }));
+    assert!(result.is_err());
+    assert_eq!(c.shared.run.snapshot(), None);
+    assert!(c.shared.state.try_lock().is_err_and(|e| matches!(e, TryLockError::Poisoned(_))));
+}
+
+#[test]
+fn run_origin_is_captured_before_isolation() {
+    assert_eq!(RunOrigin::current(), RunOrigin::Other);
+    filmcraft_media::cancel::with_export(true, || {
+        assert_eq!(RunOrigin::current(), RunOrigin::Prefetch);
+        filmcraft_frame::render_timing::task(|| {
+            let origin = RunOrigin::current();
+            assert_eq!(origin, RunOrigin::Render);
+            isolated(|| {
+                assert!(!filmcraft_frame::render_timing::active());
+                assert_eq!(origin, RunOrigin::Render);
+                Ok(())
+            })
+            .unwrap();
+        });
+    });
+}
+
+#[test]
 fn open_gop_sync_walks_a_long_chain_of_leading_pictures_without_recursing() {
     // Every GOP of 3 starts at a key whose leading picture is shown before it (#2803).
     let gops = 200_000usize;
@@ -124,11 +212,12 @@ struct FloorSamples<S> {
     pts_shift: i64,
     omit: Option<i64>,
     fail: Option<i64>,
+    cancel_at: Option<(i64, Arc<AtomicBool>)>,
 }
 
 impl<S> FloorSamples<S> {
     fn new(samples: S) -> Self {
-        Self { samples, floors: Default::default(), readbacks: Default::default(), pts_shift: 0, omit: None, fail: None }
+        Self { samples, floors: Default::default(), readbacks: Default::default(), pts_shift: 0, omit: None, fail: None, cancel_at: None }
     }
 }
 
@@ -140,6 +229,7 @@ struct FloorDec {
     pts_shift: i64,
     omit: Option<i64>,
     fail: Option<i64>,
+    cancel_at: Option<(i64, Arc<AtomicBool>)>,
 }
 
 impl FloorDec {
@@ -163,6 +253,11 @@ impl FloorDec {
 
 impl VideoDecoder for FloorDec {
     fn decode(&mut self, sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+        if let Some((at, flag)) = &self.cancel_at
+            && *at == pts
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
         if self.fail == Some(pts) {
             return Err(CodecError::Decode("mock decode error".into()));
         }
@@ -212,6 +307,7 @@ impl<S: VideoSamples> VideoSamples for FloorSamples<S> {
             pts_shift: self.pts_shift,
             omit: self.omit,
             fail: self.fail,
+            cancel_at: self.cancel_at.clone(),
         }))
     }
 }
@@ -235,6 +331,7 @@ fn export_floor_skips_readbacks_and_preserves_frames() {
                 // backward seeking, delayed output at EOF, and a request past EOF.
                 [80_500, 81_500, 40_500, 299_500, 400_000].map(|t| frame_bytes(&c.frame(&s, t).expect("frame")))
             });
+            assert_eq!(c.shared.run.snapshot(), None, "clear after successful decode");
             let readbacks = s.readbacks.load(Ordering::Relaxed);
             assert!(crate::hw::hw_stats().readbacks - before >= readbacks as u64);
             let floors = s.floors.lock().unwrap().clone();
@@ -262,6 +359,7 @@ fn export_floor_replays_without_suppression_for_pts_quirks_and_missing_frames() 
             let c = GopCache::new(None);
             let frame = filmcraft_media::cancel::with_export(export, || c.frame(&s, want)).expect("fallback frame");
             assert_eq!(index_of(&frame), expected);
+            assert_eq!(c.shared.run.snapshot(), None, "clear after suppression fallback");
             if export {
                 assert_eq!(s.samples.resets.load(Ordering::Relaxed), 2, "one bounded retry without a floor");
                 assert_eq!(s.floors.lock().unwrap().iter().filter(|p| p.is_some()).count(), 1);
@@ -306,10 +404,24 @@ fn export_floor_is_cleared_after_decode_errors() {
     let c = GopCache::new(None);
     assert!(filmcraft_media::cancel::with_export(true, || c.frame(&s, 50_000)).is_err());
     assert_eq!(s.floors.lock().unwrap().last(), Some(&None));
+    assert_eq!(c.shared.run.snapshot(), None, "clear after decode error");
     assert_eq!(c.shared.state.lock().unwrap().next, usize::MAX);
     // Frame 5 was suppressed before the error; playback must restart to recover it.
     assert_eq!(index_of(&c.frame(&s, 5_000).expect("playback after error")), 5);
     assert_eq!(s.samples.resets.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn run_descriptor_is_cleared_when_active_decode_is_cancelled() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = FloorSamples::new(samples(100, 100, 0, false));
+    s.cancel_at = Some((10_000, flag.clone()));
+    let c = GopCache::new(None);
+    let result = filmcraft_media::cancel::with_cancel(&flag, || filmcraft_media::cancel::with_export(true, || c.frame(&s, 50_000)));
+    assert!(matches!(result, Err(CodecError::Cancelled)));
+    assert_eq!(c.shared.run.snapshot(), None);
+    assert_eq!(s.floors.lock().unwrap().last(), Some(&None));
+    assert_eq!(c.shared.state.lock().unwrap().next, usize::MAX);
 }
 
 #[test]
@@ -445,7 +557,7 @@ fn concurrent_hits_finish_while_decode_is_blocked_and_mixed_requests_stay_correc
                 && let Some(entered) = self.entered.take()
             {
                 entered.send(()).unwrap();
-                self.resume.lock().unwrap().recv().expect("release blocked decoder");
+                self.resume.lock().unwrap().recv_timeout(Duration::from_secs(2)).expect("release blocked decoder");
             }
             self.inner.decode(sample, pts)
         }
@@ -492,29 +604,41 @@ fn concurrent_hits_finish_while_decode_is_blocked_and_mixed_requests_stay_correc
     {
         let (c, s, done) = (c.clone(), s.clone(), done_tx.clone());
         threads.push(std::thread::spawn(move || {
-            assert_eq!(index_of(&c.frame(s.as_ref(), 95_000).unwrap()), 95);
+            filmcraft_media::cancel::with_export(true, || {
+                assert_eq!(index_of(&c.frame(s.as_ref(), 95_000).unwrap()), 95);
+            });
             done.send(()).unwrap();
         }));
     }
     entered_rx.recv_timeout(Duration::from_secs(2)).expect("decode reached the blocking sample");
     assert!(matches!(c.shared.state.try_lock(), Err(TryLockError::WouldBlock)));
 
+    let run = c.shared.run.snapshot().expect("published while decoder mutex is busy");
+    assert_eq!(run.origin, RunOrigin::Prefetch);
+    assert!(!run.covers(31_000), "already output");
+    assert!(run.covers(64_000), "continuation's pending/current output");
+    assert!(run.covers(95_000));
+    assert!(!run.covers(96_000), "past the target");
+    // This first sample remains usable after the holder clears its publication.
+    let first_sample = run;
     let start = Arc::new(Barrier::new(13));
     let (hit_tx, hit_rx) = mpsc::channel();
     for worker in 0..12 {
         let (c, s, start, hit, done) = (c.clone(), s.clone(), start.clone(), hit_tx.clone(), done_tx.clone());
         threads.push(std::thread::spawn(move || {
-            start.wait();
-            let first = if worker % 2 == 0 { worker / 2 } else { 95 };
-            assert_eq!(index_of(&c.frame(s.as_ref(), first as i64 * 1000).unwrap()), first);
-            if worker % 2 == 0 {
-                hit.send(first).unwrap();
-            }
-            for step in 0..32 {
-                let i = if step % 2 == 0 { first } else { (worker * 17 + step * 11) % 160 };
-                assert_eq!(index_of(&c.frame(s.as_ref(), i as i64 * 1000).unwrap()), i);
-            }
-            done.send(()).unwrap();
+            filmcraft_frame::render_timing::task(|| {
+                start.wait();
+                let first = if worker % 2 == 0 { worker / 2 } else { 95 };
+                assert_eq!(index_of(&c.frame(s.as_ref(), first as i64 * 1000).unwrap()), first);
+                if worker % 2 == 0 {
+                    hit.send(first).unwrap();
+                }
+                for step in 0..32 {
+                    let i = if step % 2 == 0 { first } else { (worker * 17 + step * 11) % 160 };
+                    assert_eq!(index_of(&c.frame(s.as_ref(), i as i64 * 1000).unwrap()), i);
+                }
+                done.send(()).unwrap();
+            })
         }));
     }
     start.wait();
@@ -531,6 +655,9 @@ fn concurrent_hits_finish_while_decode_is_blocked_and_mixed_requests_stay_correc
     for thread in threads {
         thread.join().unwrap();
     }
+    assert_eq!(c.shared.run.snapshot(), None);
+    assert!(first_sample.covers(95_000));
+    assert_eq!(first_sample.origin, RunOrigin::Prefetch);
 }
 
 #[test]
@@ -750,6 +877,7 @@ fn intra_frames_decode_in_parallel_once_each() {
             }
         });
         assert_eq!(s.decodes.load(Ordering::Relaxed), 64, "cold frames decode once; warm requests hit the cache");
+        assert_eq!(c.shared.run.snapshot(), None, "intra ownership clears before releasing the mutex");
     }
     assert_eq!(s.resets.load(Ordering::Relaxed), 0);
 }
@@ -832,6 +960,7 @@ fn cancelled_request_stops_decoding_and_keeps_state() {
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r = filmcraft_media::cancel::with_cancel(&flag, || c.frame(&s, 200_000));
     assert!(matches!(r, Err(CodecError::Cancelled)));
+    assert_eq!(c.shared.run.snapshot(), None);
     assert_eq!(s.decodes.load(Ordering::Relaxed), 6);
     // cached frames are still served, and the decoder carries on from where it was
     let r = filmcraft_media::cancel::with_cancel(&flag, || c.frame(&s, 3_000));

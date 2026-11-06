@@ -32,6 +32,15 @@ static GPU_OUTPUT_CONVERT: AtomicU64 = AtomicU64::new(0);
 static CPU_INPUT_CONVERT: AtomicU64 = AtomicU64::new(0);
 static CPU_OUTPUT_CONVERT: AtomicU64 = AtomicU64::new(0);
 static DECODE_RUN: AtomicU64 = AtomicU64::new(0);
+static QUEUE_COVERED: AtomicU64 = AtomicU64::new(0);
+static QUEUE_NOT_COVERED: AtomicU64 = AtomicU64::new(0);
+static QUEUE_PREFETCH: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct QueueWait {
+    covered: bool,
+    behind_prefetch: bool,
+}
 
 #[derive(Clone, Copy)]
 struct Clock {
@@ -39,13 +48,25 @@ struct Clock {
     since: Instant,
     ns: [u64; 8],
     gpu_frame: bool,
+    queue_wait: QueueWait,
+    queue_ns: [u64; 3],
 }
 
 impl Clock {
     fn settle(&mut self, now: Instant) {
         let ns = nanos(now.saturating_duration_since(self.since));
         if let Some(part) = self.ns.get_mut(self.phase as usize) {
+            let before = *part;
             *part = part.saturating_add(ns);
+            if self.phase == Phase::DecoderQueue {
+                // Use precisely the time settled to the existing phase, including saturation.
+                let elapsed = *part - before;
+                let partition = usize::from(!self.queue_wait.covered);
+                self.queue_ns[partition] = self.queue_ns[partition].saturating_add(elapsed);
+                if self.queue_wait.behind_prefetch {
+                    self.queue_ns[2] = self.queue_ns[2].saturating_add(elapsed);
+                }
+            }
         }
         self.since = now;
     }
@@ -80,7 +101,7 @@ pub fn mark_gpu_frame() {
 
 /// A stage scope, confined to its calling thread; inactive outside render tasks.
 pub struct Interval {
-    previous: Option<Phase>,
+    previous: Option<(Phase, QueueWait)>,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -89,12 +110,27 @@ pub fn enter(phase: Phase) -> Interval {
     let previous = CLOCK.with(|c| {
         let mut clock = c.get()?;
         clock.settle(Instant::now());
-        let previous = clock.phase;
+        let previous = (clock.phase, clock.queue_wait);
         clock.phase = phase;
+        clock.queue_wait = QueueWait::default();
         c.set(Some(clock));
         Some(previous)
     });
     Interval { previous, _thread: PhantomData }
+}
+
+/// Classify acquisition using the holder's first coherent sample. The classification stays
+/// fixed for this wait even if the holder changes; this is intentionally an approximation.
+/// Like every interval this is inactive outside a render task.
+pub fn decoder_queue(covered: bool, behind_prefetch: bool) -> Interval {
+    let interval = enter(Phase::DecoderQueue);
+    CLOCK.with(|c| {
+        if let Some(mut clock) = c.get() {
+            clock.queue_wait = QueueWait { covered, behind_prefetch };
+            c.set(Some(clock));
+        }
+    });
+    interval
 }
 
 /// Placement/blending invoked by an effect belongs to the effect, not compositing.
@@ -108,11 +144,12 @@ pub fn composite() -> Interval {
 
 impl Drop for Interval {
     fn drop(&mut self) {
-        if let Some(previous) = self.previous {
+        if let Some((previous, queue_wait)) = self.previous {
             CLOCK.with(|c| {
                 if let Some(mut clock) = c.get() {
                     clock.settle(Instant::now());
                     clock.phase = previous;
+                    clock.queue_wait = queue_wait;
                     c.set(Some(clock));
                 }
             });
@@ -134,6 +171,9 @@ impl Drop for Task {
                 }
                 let input = clock.ns.get(Phase::InputConvert as usize).copied().unwrap_or(0);
                 let output = clock.ns.get(Phase::OutputConvert as usize).copied().unwrap_or(0);
+                for (counter, ns) in [&QUEUE_COVERED, &QUEUE_NOT_COVERED, &QUEUE_PREFETCH].into_iter().zip(clock.queue_ns) {
+                    add(counter, ns);
+                }
                 add(&CONVERT, input.saturating_add(output));
                 let (input_counter, output_counter) =
                     if clock.gpu_frame { (&GPU_INPUT_CONVERT, &GPU_OUTPUT_CONVERT) } else { (&CPU_INPUT_CONVERT, &CPU_OUTPUT_CONVERT) };
@@ -157,7 +197,7 @@ pub fn task<T>(f: impl FnOnce() -> T) -> T {
             clock.settle(now);
             clock
         });
-        c.set(Some(Clock { phase: Phase::Other, since: now, ns: [0; 8], gpu_frame: false }));
+        c.set(Some(Clock { phase: Phase::Other, since: now, ns: [0; 8], gpu_frame: false, queue_wait: QueueWait::default(), queue_ns: [0; 3] }));
         parent
     });
     let _task = Task(parent);
@@ -202,6 +242,9 @@ pub fn times() -> Vec<(&'static str, u64)> {
         times.push((name, counter.load(Relaxed)));
     }
     times.extend([
+        ("decoderQueueCoveredMs", QUEUE_COVERED.load(Relaxed)),
+        ("decoderQueueNotCoveredMs", QUEUE_NOT_COVERED.load(Relaxed)),
+        ("decoderQueueBehindPrefetchMs", QUEUE_PREFETCH.load(Relaxed)),
         ("convertMs", CONVERT.load(Relaxed)),
         ("gpuInputConvertMs", GPU_INPUT_CONVERT.load(Relaxed)),
         ("gpuOutputConvertMs", GPU_OUTPUT_CONVERT.load(Relaxed)),
@@ -214,6 +257,77 @@ pub fn times() -> Vec<(&'static str, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_queue_partitions_settled_time_and_restores_first_sample() {
+        let snapshot = || [QUEUE_COVERED.load(Relaxed), QUEUE_NOT_COVERED.load(Relaxed), QUEUE_PREFETCH.load(Relaxed)];
+        let before = times();
+        let idle = snapshot();
+        drop(decoder_queue(true, true));
+        assert_eq!(snapshot(), idle, "prefetch/playback without a render clock publishes no wait");
+        assert!(!active());
+        task(|| {
+            let _queue = decoder_queue(true, true);
+            let parent = CLOCK.with(|c| c.get().unwrap());
+            task(|| {
+                let _other_queue = decoder_queue(false, false);
+                CLOCK.with(|c| {
+                    let mut clock = c.get().unwrap();
+                    clock.settle(clock.since + web_time::Duration::from_millis(1));
+                    assert_eq!(clock.queue_ns[0], 0);
+                    assert_eq!(clock.queue_ns[1], clock.ns[Phase::DecoderQueue as usize]);
+                    assert_eq!(clock.queue_ns[2], 0);
+                    c.set(Some(clock));
+                });
+            });
+            assert_eq!(CLOCK.with(|c| c.get().unwrap().queue_wait), parent.queue_wait);
+            // A phase nested inside the wait and an isolated decode restore its initial sample.
+            drop(enter(Phase::FrameMapWait));
+            decode_run(true, || {
+                assert!(!active());
+                let before = snapshot();
+                drop(decoder_queue(false, false));
+                assert_eq!(snapshot(), before, "decode execution has no render clock");
+            });
+            assert_eq!(CLOCK.with(|c| c.get().unwrap().queue_wait), parent.queue_wait);
+            {
+                let _queue = decoder_queue(false, true);
+                drop(enter(Phase::Other));
+            }
+            CLOCK.with(|c| {
+                let mut clock = c.get().unwrap();
+                clock.settle(Instant::now());
+                assert_eq!(clock.queue_ns[0].saturating_add(clock.queue_ns[1]), clock.ns[Phase::DecoderQueue as usize]);
+                assert_eq!(clock.queue_ns[2], clock.ns[Phase::DecoderQueue as usize]);
+                // Once the existing phase saturates, no classification adds further time.
+                clock.ns[Phase::DecoderQueue as usize] = u64::MAX;
+                let parts = clock.queue_ns;
+                clock.settle(clock.since + web_time::Duration::from_millis(1));
+                assert_eq!(clock.queue_ns, parts);
+            });
+        });
+        let after = times();
+        let keys = ["decoderQueueMs", "decoderQueueCoveredMs", "decoderQueueNotCoveredMs", "decoderQueueBehindPrefetchMs"];
+        let delta = keys.map(|key| {
+            let get = |snapshot: &[(&str, u64)]| snapshot.iter().find(|(name, _)| *name == key).unwrap().1;
+            assert!(get(&after) >= get(&before), "{key} must be cumulative");
+            get(&after) - get(&before)
+        });
+        assert_eq!(delta[0], delta[1] + delta[2], "completed-task publication preserves the exact partition");
+        assert!(delta[2] >= 1_000_000);
+        assert!(delta[3] <= delta[0]);
+        // Verify first-sample restoration through unwind without publishing a second task.
+        task(|| {
+            let _queue = decoder_queue(true, false);
+            let result = std::panic::catch_unwind(|| {
+                let _inner = decoder_queue(false, true);
+                panic!("queue unwind");
+            });
+            assert!(result.is_err());
+            assert_eq!(CLOCK.with(|c| c.get().unwrap().queue_wait), QueueWait { covered: true, behind_prefetch: false });
+        });
+        assert!(!active());
+    }
 
     #[test]
     fn conversion_times_are_attributed_to_gpu_and_cpu_tasks() {

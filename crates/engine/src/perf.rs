@@ -169,7 +169,15 @@ mod tests {
         for (name, _) in filmcraft_frame::render_timing::times() {
             assert!(v["export"]["renderTasks"][name].is_number(), "renderTasks.{name}");
         }
-        for name in ["gpuInputConvertMs", "gpuOutputConvertMs", "cpuInputConvertMs", "cpuOutputConvertMs"] {
+        for name in [
+            "gpuInputConvertMs",
+            "gpuOutputConvertMs",
+            "cpuInputConvertMs",
+            "cpuOutputConvertMs",
+            "decoderQueueCoveredMs",
+            "decoderQueueNotCoveredMs",
+            "decoderQueueBehindPrefetchMs",
+        ] {
             assert!(v["export"]["renderTasks"][name].is_number(), "renderTasks.{name}");
         }
         for (name, _) in filmcraft_export::outside_times() {
